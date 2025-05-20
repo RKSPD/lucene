@@ -1,0 +1,4 @@
+JVector (io.github.jbellis:jvector:3.0.6)
+Agrona (org.agrona:agrona:1.20.0)
+Apache Commons Math (org.apache.commons:commons-math3:3.6.1)
+SLF4J API Module (org.slf4j:slf4j-api:2.0.16)
