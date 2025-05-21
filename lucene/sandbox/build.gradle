@@ -33,25 +33,112 @@
 //}
 //
 //
-
+// ---------- BRUHMOMENT POV --------
+//
+//apply plugin: 'java-library'
+//
+//description = 'Various third party contributions and new ideas'
+//
+//configurations {
+//  implementation {
+//    resolutionStrategy {
+//      force 'io.github.jbellis:jvector:3.0.6'
+//    }
+//  }
+//}
+//
+//dependencies {
+//  moduleApi project(':lucene:core')
+//  moduleApi project(':lucene:queries')
+//  moduleApi project(':lucene:facet')
+//  moduleTestImplementation project(':lucene:test-framework')
+//
+//  implementation ('io.github.jbellis:jvector:4.0.0-beta.4')
+//  implementation 'org.agrona:agrona:1.20.0'
+//  implementation 'org.slf4j:slf4j-api:1.7.36'
+//}
+//
+//tasks.withType(JavaCompile) {
+//  inputs.files(configurations.runtimeClasspath)
+//  doFirst {
+//    options.compilerArgs += [
+//            '--module-path', configurations.runtimeClasspath.asPath,
+//            '--add-modules', 'jvector',
+//            '--patch-module', "org.apache.lucene.sandbox=${sourceSets.main.output.asPath}"
+//    ]
+//  }
+//}
+//
+//tasks.named('test') {
+//  inputs.files(configurations.runtimeClasspath)
+//  doFirst {
+//    jvmArgs += [
+//            '--module-path', configurations.runtimeClasspath.asPath,
+//            '--add-modules', 'jvector'
+//    ]
+//  }
+//}
+//
+//// Disable all validation tasks
+//allprojects {
+//  tasks.all { task ->
+//    if (task.name.contains('validate')) {
+//      task.enabled = false
+//    }
+//  }
+//}
 
 apply plugin: 'java-library'
 
 description = 'Various third party contributions and new ideas'
 
+// ------------------ DEPENDENCIES ------------------ //
 dependencies {
   moduleApi project(':lucene:core')
   moduleApi project(':lucene:queries')
   moduleApi project(':lucene:facet')
   moduleTestImplementation project(':lucene:test-framework')
-  implementation 'io.github.jbellis:jvector:3.0.6'
+
+  // ✅ External libraries
+  implementation 'io.github.jbellis:jvector:4.0.0-beta.4'
+  implementation 'org.agrona:agrona:1.20.0'
+  implementation 'org.slf4j:slf4j-api:1.7.36'
 }
 
-// Disable all validation tasks
+// ------------------ JAVAC MODULE PATCH ------------------ //
+tasks.withType(JavaCompile).configureEach {
+  doFirst {
+    // ✅ Ensures javac recognizes external modules
+    options.compilerArgs += [
+            '--module-path', classpath.asPath,
+            '--add-modules', 'ALL-MODULE-PATH', // 'jvector' not explicitly named; this includes everything
+            '--patch-module', "org.apache.lucene.sandbox=${sourceSets.main.output.asPath}"
+    ]
+  }
+}
+
+// ------------------ TEST JVM MODULE PATCH ------------------ //
+tasks.named('test') {
+  doFirst {
+    jvmArgs += [
+            '--module-path', classpath.asPath,
+            '--add-modules', 'ALL-MODULE-PATH'
+    ]
+  }
+}
+
+// ------------------ OPTIONAL: Disable checksum + errorprone ------------------ //
+tasks.withType(JavaCompile).configureEach {
+  if (options.hasProperty('errorprone')) {
+    options.errorprone.enabled = false
+  }
+}
+
 allprojects {
-  tasks.all { task ->
+  tasks.configureEach { task ->
     if (task.name.contains('validate')) {
       task.enabled = false
     }
   }
 }
+
