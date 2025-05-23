@@ -1,7 +1,7 @@
 package org.apache.lucene.sandbox.codecs.jvector;
 
 // This class extends an abstract class in the OpenSearch impl. that's not included in Lucene Sandbox
-public class JVectorDiskANNMethod {
+public class JVectorDiskANNMethod extends KNNMethod {
 
 }
 

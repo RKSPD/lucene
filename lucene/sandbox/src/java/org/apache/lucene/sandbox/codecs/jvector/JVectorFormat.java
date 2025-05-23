@@ -8,29 +8,7 @@ import org.apache.lucene.index.SegmentWriteState;
 
 import java.io.IOException;
 
-//public class JVectorFormat extends KnnVectorsFormat {
-//
-//    public static final int DEFAULT_MINIMUM_BATCH_SIZE_FOR_QUANTIZATION = 1024;
-//    public JVectorFormat() {
-//        super("JVectorFormat");
-//    }
-//
-//    @Override
-//    public KnnVectorsWriter fieldsWriter(SegmentWriteState state) throws IOException {
-//        return new JVectorWriter(state);
-//    }
-//
-//    @Override
-//    public KnnVectorsReader fieldsReader(SegmentReadState state) throws IOException {
-//        return new JVectorReader(state);
-//    }
-//
-//    @Override
-//    public int getMaxDimensions(String dim) {
-//        return 2048;
-//    }
-//}
-
+// FULLY PORTED
 
 public class JVectorFormat extends KnnVectorsFormat {
     public static final String NAME = "JVectorFormat";
@@ -73,7 +51,8 @@ public class JVectorFormat extends KnnVectorsFormat {
 
     @Override
     public KnnVectorsWriter fieldsWriter(SegmentWriteState state) throws IOException {
-        return new JVectorWriter(state);
+        return new JVectorWriter(state, maxConn, beamWidth, DEFAULT_DEGREE_OVERFLOW, DEFAULT_ALPHA, minBatchSizeForQuantization);
+        //return new JVectorWriter(state);
     }
 
     @Override

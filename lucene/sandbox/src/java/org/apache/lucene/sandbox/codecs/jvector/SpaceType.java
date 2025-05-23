@@ -4,7 +4,7 @@ import org.apache.lucene.index.VectorSimilarityFunction;
 
 public enum SpaceType {
     L2(VectorSimilarityFunction.EUCLIDEAN),
-    COSINE(VectorSimilarityFunction.COSINE),
+    COSINESIMIL(VectorSimilarityFunction.COSINE),
     INNER_PRODUCT(VectorSimilarityFunction.DOT_PRODUCT),
     UNDEFINED(null);
 
@@ -22,7 +22,7 @@ public enum SpaceType {
     public float scoreTranslation(float rawScore) {
         return switch (this) {
             case L2 -> 1 / (1 + rawScore);
-            case COSINE -> Math.max((2.0f - rawScore) / 2.0f, 0.f);
+            case COSINESIMIL -> Math.max((2.0f - rawScore) / 2.0f, 0.f);
             case INNER_PRODUCT -> rawScore >= 0 ? 1 / (1 + rawScore) : -rawScore + 1;
             default -> throw new IllegalArgumentException("Unrecognized space type: " + this);
         };
