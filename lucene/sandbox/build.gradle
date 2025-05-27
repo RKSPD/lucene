@@ -99,10 +99,12 @@ dependencies {
   moduleApi project(':lucene:facet')
   moduleTestImplementation project(':lucene:test-framework')
 
+
   // ✅ External libraries
   implementation 'io.github.jbellis:jvector:4.0.0-beta.4'
   implementation 'org.agrona:agrona:1.20.0'
   implementation 'org.slf4j:slf4j-api:1.7.36'
+
 }
 
 // ------------------ JAVAC MODULE PATCH ------------------ //
@@ -141,4 +143,31 @@ allprojects {
     }
   }
 }
+
+
+
+// ----------------- RUN TASKS ----------------- //
+
+tasks.register('runJVectorWriterTest', JavaExec) {
+  group = 'verification'
+  description = 'Run JVectorWriterTest directly for local testing'
+  classpath = sourceSets.main.runtimeClasspath
+  mainClass = 'org.apache.lucene.sandbox.codecs.jvector.JVectorWriterTest'
+}
+
+tasks.register('runJVectorPipelineTest', JavaExec) {
+  group = 'verification'
+  description = 'Run JVectorPipelineTest directly for full pipeline testing'
+  classpath = sourceSets.main.runtimeClasspath
+  mainClass = 'org.apache.lucene.sandbox.codecs.jvector.JVectorPipelineTest'
+}
+
+tasks.register('runJVectorIntensiveTest', JavaExec) {
+  group = 'verification'
+  description = 'Run JVectorIntensiveTest directly for local testing'
+  classpath = sourceSets.test.runtimeClasspath // Still use test classpath for this utility
+  mainClass = 'org.apache.lucene.sandbox.codecs.jvector.JVectorIntensiveTest'
+  systemProperties = System.properties
+}
+
 
