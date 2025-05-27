@@ -5,7 +5,6 @@ import io.github.jbellis.jvector.graph.disk.feature.FeatureId;
 import io.github.jbellis.jvector.graph.disk.feature.InlineVectors;
 import org.apache.lucene.codecs.KnnFieldVectorsWriter;
 import org.apache.lucene.codecs.KnnVectorsWriter;
-import org.apache.lucene.document.Field;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.SegmentWriteState;
 import org.apache.lucene.index.Sorter;
@@ -21,16 +20,12 @@ import io.github.jbellis.jvector.vector.VectorizationProvider;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
 import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
 import org.apache.lucene.codecs.CodecUtil;
-import org.apache.lucene.codecs.KnnFieldVectorsWriter;
-import org.apache.lucene.codecs.KnnVectorsWriter;
 import org.apache.lucene.index.*;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.store.*;
-import org.apache.lucene.util.AttributeSource;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.RamUsageEstimator;
 
-import javax.swing.text.Segment;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.util.*;
@@ -116,6 +111,7 @@ public class JVectorWriter extends KnnVectorsWriter {
     // public JVectorWriter(SegmentWriteState state) throws IOException {}
 
     // IMPLEMENT THESE ONE AT A TIME
+    @SuppressWarnings("unchecked")
     @Override
     public KnnFieldVectorsWriter<?> addField(FieldInfo fieldInfo) throws IOException {
         if (fieldInfo.getVectorEncoding() == VectorEncoding.BYTE) {
@@ -158,9 +154,9 @@ public class JVectorWriter extends KnnVectorsWriter {
             success = true;
         } finally {
             if (!success) {
-                //IOUtils.closeWhileHandlingException(this);
+                //IOUtils.closeWhileHandlingException(scorerSupplier);
             } else {
-                //IOUtils.close(this);
+                //IOUtils.close(scorerSupplier);
             }
         }
     }
@@ -180,9 +176,9 @@ public class JVectorWriter extends KnnVectorsWriter {
 
     private void writeField(FieldWriter<?> fieldData) throws IOException {
         OnHeapGraphIndex graph = fieldData.getGraph();
-        //final var vectorIndexFieldMetadata = writeGraph(graph, fieldData);
+        final var vectorIndexFieldMetadata = writeGraph(graph, fieldData);
         meta.writeInt(fieldData.fieldInfo.number);
-        //vectorIndexFieldMetadata.toOutput(meta);
+        vectorIndexFieldMetadata.toOutput(meta);
 
     }
 
@@ -195,7 +191,7 @@ public class JVectorWriter extends KnnVectorsWriter {
 
         try (
                 IndexOutput indexOutput = segmentWriteState.directory.createOutput(vectorIndexFieldFileName, segmentWriteState.context);
-                final var randomAccessWriter = new JVectorRandomAccessWriter(indexOutput);
+                final var randomAccessWriter = new JVectorRandomAccessWriter(indexOutput)
         ) {
             CodecUtil.writeIndexHeader(
                     indexOutput,
@@ -290,7 +286,7 @@ public class JVectorWriter extends KnnVectorsWriter {
             out.writeInt(fieldNumber);
             out.writeInt(vectorEncoding.ordinal());
             // TODO: Update this once reader is implemented
-            //out.writeInt(JVectorReader.VectorSimilarityMapper.distFuncToOrd(vectorSimilarityFunction));
+            out.writeInt(JVectorReader.VectorSimilarityMapper.distFuncToOrd(vectorSimilarityFunction));
             out.writeVInt(vectorDimension);
             out.writeVLong(vectorIndexOffset);
             out.writeVLong(vectorIndexLength);
@@ -320,13 +316,43 @@ public class JVectorWriter extends KnnVectorsWriter {
         public VectorIndexFieldMetadata(IndexInput in) throws IOException {
             this.fieldNumber = in.readInt();
             this.vectorEncoding = readVectorEncoding(in);
-            this.vectorSimilarityFunction = VectorSimilarityFunction.EUCLIDEAN;
-            // JVectorReader.VectorSimilarityMapper.ordToLuceneDistFunc(in.readInt());
+            this.vectorSimilarityFunction = JVectorReader.VectorSimilarityMapper.ordToLuceneDistFunc(in.readInt());
             this.vectorDimension = in.readVInt();
             this.vectorIndexOffset = in.readVLong();
             this.vectorIndexLength = in.readVLong();
             this.pqCodebooksAndVectorsOffset = in.readVLong();
             this.pqCodebooksAndVectorsLength = in.readVLong();
+        }
+        public int getFieldNumber() {
+            return fieldNumber;
+        }
+
+        public VectorEncoding getVectorEncoding() {
+            return vectorEncoding;
+        }
+
+        public VectorSimilarityFunction getVectorSimilarityFunction() {
+            return vectorSimilarityFunction;
+        }
+
+        public int getVectorDimension() {
+            return vectorDimension;
+        }
+
+        public long getVectorIndexOffset() {
+            return vectorIndexOffset;
+        }
+
+        public long getVectorIndexLength() {
+            return vectorIndexLength;
+        }
+
+        public long getPqCodebooksAndVectorsOffset() {
+            return pqCodebooksAndVectorsOffset;
+        }
+
+        public long getPqCodebooksAndVectorsLength() {
+            return pqCodebooksAndVectorsLength;
         }
 
     }
