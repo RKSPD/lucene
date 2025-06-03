@@ -213,7 +213,7 @@ public class JVectorWriter extends KnnVectorsWriter {
                     segmentWriteState.segmentSuffix
             );
 
-            long startOffset = indexOutput.getFilePointer();
+            final long startOffset = indexOutput.getFilePointer();
 
             System.out.println("Writing graph to " + vectorIndexFieldFileName);
 
@@ -247,7 +247,8 @@ public class JVectorWriter extends KnnVectorsWriter {
             return new VectorIndexFieldMetadata(
                     fieldData.fieldInfo.number,
                     fieldData.fieldInfo.getVectorEncoding(),
-                    fieldData.fieldInfo.getVectorSimilarityFunction(),
+                    VectorSimilarityFunction.DOT_PRODUCT,
+                    //fieldData.fieldInfo.getVectorSimilarityFunction(),
                     fieldData.randomAccessVectorValues.dimension(),
                     startOffset,
                     endGraphOffset - startOffset,
@@ -271,9 +272,12 @@ public class JVectorWriter extends KnnVectorsWriter {
 
         // TODO: should we make this configurable?
         // Compress the original vectors using PQ. this represents a compression ratio of 128 * 4 / 16 = 32x
-        final var M = Math.min(fieldData.randomAccessVectorValues.dimension(), 16); // number of subspaces
-        final var numberOfClustersPerSubspace = Math.min(256, fieldData.randomAccessVectorValues.size()); // number of centroids per
+        //final var M = Math.min(fieldData.randomAccessVectorValues.dimension(), 32); // number of subspaces
+        final int M = 8;
+        //final var numberOfClustersPerSubspace = Math.min(1024, fieldData.randomAccessVectorValues.size()); // number of centroids per
         // subspace
+
+        final int numberOfClustersPerSubspace = fieldData.randomAccessVectorValues.size();
         ProductQuantization pq = ProductQuantization.compute(
                 fieldData.randomAccessVectorValues,
                 M, // number of subspaces
@@ -298,7 +302,6 @@ public class JVectorWriter extends KnnVectorsWriter {
         public void toOutput(IndexOutput out) throws IOException {
             out.writeInt(fieldNumber);
             out.writeInt(vectorEncoding.ordinal());
-            // TODO: Update this once the reader code actually works...
             out.writeInt(luceneToJVectorOrd(vectorSimilarityFunction)); // Write JVector ordinals
             out.writeVInt(vectorDimension);
             System.out.println("vectorIndexOffset=" + vectorIndexOffset);
@@ -468,16 +471,17 @@ public class JVectorWriter extends KnnVectorsWriter {
         }
 
         io.github.jbellis.jvector.vector.VectorSimilarityFunction getVectorSimilarityFunction(FieldInfo fieldInfo) {
-            switch (fieldInfo.getVectorSimilarityFunction()) {
-                case EUCLIDEAN:
-                    return io.github.jbellis.jvector.vector.VectorSimilarityFunction.EUCLIDEAN;
-                case COSINE:
-                    return io.github.jbellis.jvector.vector.VectorSimilarityFunction.COSINE;
-                case DOT_PRODUCT:
-                    return io.github.jbellis.jvector.vector.VectorSimilarityFunction.DOT_PRODUCT;
-                default:
-                    throw new IllegalArgumentException("Unsupported similarity function: " + fieldInfo.getVectorSimilarityFunction());
-            }
+//            switch (fieldInfo.getVectorSimilarityFunction()) {
+//                case EUCLIDEAN:
+//                    return io.github.jbellis.jvector.vector.VectorSimilarityFunction.EUCLIDEAN;
+//                case COSINE:
+//                    return io.github.jbellis.jvector.vector.VectorSimilarityFunction.COSINE;
+//                case DOT_PRODUCT:
+//                    return io.github.jbellis.jvector.vector.VectorSimilarityFunction.DOT_PRODUCT;
+//                default:
+//                    throw new IllegalArgumentException("Unsupported similarity function: " + fieldInfo.getVectorSimilarityFunction());
+//            }
+            return io.github.jbellis.jvector.vector.VectorSimilarityFunction.DOT_PRODUCT;
         }
 
         /**

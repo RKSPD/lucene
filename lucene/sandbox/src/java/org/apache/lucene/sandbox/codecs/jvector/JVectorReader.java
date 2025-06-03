@@ -28,7 +28,7 @@ import java.util.Map;
 // ----------- SKELETON -------------
 public class JVectorReader extends KnnVectorsReader {
     private static final VectorTypeSupport VECTOR_TYPE_SUPPORT = VectorizationProvider.getInstance().getVectorTypeSupport();
-    private static final int DEFAULT_OVER_QUERY_FACTOR = 5;
+    private static final int DEFAULT_OVER_QUERY_FACTOR = 100;
 
     private final FieldInfos fieldInfos;
     private final String baseDataFileName;
@@ -72,7 +72,7 @@ public class JVectorReader extends KnnVectorsReader {
         }
     }
 
-    // TODO: Do this later
+
     @Override
     public FloatVectorValues getFloatVectorValues(String field) throws IOException {
         return new JVectorFloatVectorValues(fieldEntryMap.get(field).index, fieldEntryMap.get(field).similarityFunction);
@@ -96,9 +96,9 @@ public class JVectorReader extends KnnVectorsReader {
 
                 ScoreFunction.ApproximateScoreFunction asf = pqVectors.precomputedScoreFunctionFor(
                         q,
-                        fieldEntryMap.get(field).similarityFunction
+                        VectorSimilarityFunction.DOT_PRODUCT//fieldEntryMap.get(field).similarityFunction
                 );
-                ScoreFunction.ExactScoreFunction reranker = view.rerankerFor(q, fieldEntryMap.get(field).similarityFunction);
+                ScoreFunction.ExactScoreFunction reranker = view.rerankerFor(q, VectorSimilarityFunction.DOT_PRODUCT); //fieldEntryMap.get(field).similarityFunction);
                 ssp = new SearchScoreProvider(asf, reranker);
             } else {
                 ssp = SearchScoreProvider.exact(q, fieldEntryMap.get(field).similarityFunction, view);
@@ -161,9 +161,10 @@ public class JVectorReader extends KnnVectorsReader {
 
         public FieldEntry(FieldInfo fieldInfo, JVectorWriter.VectorIndexFieldMetadata vectorIndexFieldMetadata) throws IOException {
             this.fieldInfo = fieldInfo;
-            this.similarityFunction = VectorSimilarityMapper.ordToDistFunc(
-                    vectorIndexFieldMetadata.getVectorSimilarityFunction().ordinal()
-            );
+//            this.similarityFunction = VectorSimilarityMapper.ordToDistFunc(
+//                    vectorIndexFieldMetadata.getVectorSimilarityFunction().ordinal()
+//            );
+            this.similarityFunction = VectorSimilarityFunction.DOT_PRODUCT;
             this.vectorEncoding = vectorIndexFieldMetadata.getVectorEncoding();
             this.vectorIndexOffset = vectorIndexFieldMetadata.getVectorIndexOffset();
             this.vectorIndexLength = vectorIndexFieldMetadata.getVectorIndexLength();

@@ -135,66 +135,66 @@ public class JVectorRandomAccessWriter implements RandomAccessWriter {
 
     @Override
     public void seek(long position) throws IOException {
-        System.out.println("🔵 JVectorRandomAccessWriter.seek(" + position + ")");
+        //System.out.println("🔵 JVectorRandomAccessWriter.seek(" + position + ")");
     }
 
     @Override
     public long position() throws IOException {
         long pos = indexOutputDelegate.getFilePointer();
-        System.out.println("🔵 JVectorRandomAccessWriter.position() = " + pos);
+        //System.out.println("🔵 JVectorRandomAccessWriter.position() = " + pos);
         return pos;
     }
 
     @Override
     public void flush() throws IOException {
-        System.out.println("🔵 JVectorRandomAccessWriter.flush()");
+        //System.out.println("🔵 JVectorRandomAccessWriter.flush()");
     }
 
     @Override
     public long checksum(long startOffset, long endOffset) throws IOException {
-        System.out.println("🔵 JVectorRandomAccessWriter.checksum(" + startOffset + ", " + endOffset + ")");
+        //System.out.println("🔵 JVectorRandomAccessWriter.checksum(" + startOffset + ", " + endOffset + ")");
         return 0;
     }
 
     @Override
     public void close() throws IOException {
-        System.out.println("🚨 JVectorRandomAccessWriter.close() called! Closing indexOutputDelegate...");
+        //System.out.println("🚨 JVectorRandomAccessWriter.close() called! Closing indexOutputDelegate...");
         indexOutputDelegate.close();
     }
 
     @Override
     public void write(int b) throws IOException {
-        System.out.println("📝 write(int): " + b);
+        //System.out.println("📝 write(int): " + b);
         indexOutputDelegate.writeByte((byte) b);
     }
 
     @Override
     public void write(byte[] b) throws IOException {
-        System.out.println("📝 write(byte[]) of length " + b.length);
+        //System.out.println("📝 write(byte[]) of length " + b.length);
         indexOutputDelegate.writeBytes(b, 0, b.length);
     }
 
     @Override
     public void write(byte[] b, int off, int len) throws IOException {
-        System.out.println("📝 write(byte[], " + off + ", " + len + ")");
+        //System.out.println("📝 write(byte[], " + off + ", " + len + ")");
         indexOutputDelegate.writeBytes(b, off, len);
     }
 
     @Override
     public void writeBoolean(boolean v) throws IOException {
-        System.out.println("📝 writeBoolean: " + v);
+        //System.out.println("📝 writeBoolean: " + v);
         indexOutputDelegate.writeByte((byte) (v ? 1 : 0));
     }
 
     @Override
     public void writeByte(int v) throws IOException {
-        System.out.println("📝 writeByte: " + v);
+        //System.out.println("📝 writeByte: " + v);
         indexOutputDelegate.writeByte((byte) v);
     }
 
     @Override
     public void writeShort(int v) throws IOException {
-        System.out.println("📝 writeShort: " + v);
+        //System.out.println("📝 writeShort: " + v);
         indexOutputDelegate.writeShort((short) v);
     }
 
@@ -205,26 +205,26 @@ public class JVectorRandomAccessWriter implements RandomAccessWriter {
 
     @Override
     public void writeInt(int v) throws IOException {
-        System.out.println("📝 writeInt: " + v);
+        //System.out.println("📝 writeInt: " + v);
         indexOutputDelegate.writeInt(v);
     }
 
     @Override
     public void writeLong(long v) throws IOException {
-        System.out.println("📝 writeLong: " + v);
+        //System.out.println("📝 writeLong: " + v);
         indexOutputDelegate.writeLong(v);
     }
 
     @Override
     public void writeFloat(float v) throws IOException {
-        System.out.println("📝 writeFloat: " + v);
+        //System.out.println("📝 writeFloat: " + v);
         ByteBuffer.wrap(writeBuffer).putFloat(v);
         indexOutputDelegate.writeBytes(writeBuffer, 0, Float.BYTES);
     }
 
     @Override
     public void writeDouble(double v) throws IOException {
-        System.out.println("📝 writeDouble: " + v);
+        //System.out.println("📝 writeDouble: " + v);
         writeLong(Double.doubleToLongBits(v));
     }
 
