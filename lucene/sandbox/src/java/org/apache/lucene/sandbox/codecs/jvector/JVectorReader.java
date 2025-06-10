@@ -28,7 +28,7 @@ import java.util.Map;
 // ----------- SKELETON -------------
 public class JVectorReader extends KnnVectorsReader {
     private static final VectorTypeSupport VECTOR_TYPE_SUPPORT = VectorizationProvider.getInstance().getVectorTypeSupport();
-    private static final int DEFAULT_OVER_QUERY_FACTOR = 100;
+    private static final int DEFAULT_OVER_QUERY_FACTOR = 50;
 
     private final FieldInfos fieldInfos;
     private final String baseDataFileName;
@@ -62,6 +62,9 @@ public class JVectorReader extends KnnVectorsReader {
             }
         }
     }
+    public Map<String, FieldEntry> getFieldEntryMap() {
+        return fieldEntryMap;
+    }
 
     @Override
     public void checkIntegrity() throws IOException {
@@ -83,39 +86,68 @@ public class JVectorReader extends KnnVectorsReader {
         return null;
     }
 
+    private int calculateRerankK(int k, int graphSize) {
+        int targetRerank = 50000;
+        // Never ask for more candidates than exist in the dataset
+        return Math.min(targetRerank, graphSize);
+    }
+
+
     @Override
     public void search(String field, float[] target, KnnCollector knnCollector, Bits acceptDocs) throws IOException {
+        acceptDocs = null;
         final OnDiskGraphIndex index = fieldEntryMap.get(field).index;
-
+        //System.out.println("DEBUG SEARCH: Index size as seen by search method: " + index.size(0)); // <--- ADD THIS LINE
         VectorFloat<?> q = VECTOR_TYPE_SUPPORT.createFloatVector(target);
         final SearchScoreProvider ssp;
 
         try (var view = index.getView()) {
+            //System.out.println("View created successfully ✅");
             if (fieldEntryMap.get(field).pqVectors != null) {
+                //System.out.println("USING PQ VECTORS ✅");
                 final PQVectors pqVectors = fieldEntryMap.get(field).pqVectors;
 
                 ScoreFunction.ApproximateScoreFunction asf = pqVectors.precomputedScoreFunctionFor(
                         q,
-                        VectorSimilarityFunction.DOT_PRODUCT//fieldEntryMap.get(field).similarityFunction
+                        //VectorSimilarityFunction.DOT_PRODUCT
+                        fieldEntryMap.get(field).similarityFunction
                 );
-                ScoreFunction.ExactScoreFunction reranker = view.rerankerFor(q, VectorSimilarityFunction.DOT_PRODUCT); //fieldEntryMap.get(field).similarityFunction);
+                ScoreFunction.ExactScoreFunction reranker = view.rerankerFor(q, fieldEntryMap.get(field).similarityFunction);
                 ssp = new SearchScoreProvider(asf, reranker);
             } else {
+                //System.out.println("NOT USING PQ VECTORS ⚠️");
                 ssp = SearchScoreProvider.exact(q, fieldEntryMap.get(field).similarityFunction, view);
             }
-            io.github.jbellis.jvector.util.Bits compatibleBits = doc -> acceptDocs == null || acceptDocs.get(doc);
+            Bits finalAcceptDocs = acceptDocs;
+            if(acceptDocs == null) {
+                //System.out.println("ACCEPT DOCS IS NULL");
+            }
+            io.github.jbellis.jvector.util.Bits compatibleBits = doc -> finalAcceptDocs == null || finalAcceptDocs.get(doc);
             try (var graphSearcher = new GraphSearcher(index)) {
+                //System.out.println("Graph searcher created successfully 👍🏾");
+                int reRankK = calculateRerankK(knnCollector.k(), index.size(0));
+                //System.out.println("Rerank K: " + reRankK);
                 final var searchResults = graphSearcher.search(
                         ssp,
                         knnCollector.k(),
-                        knnCollector.k() * DEFAULT_OVER_QUERY_FACTOR,
+                        reRankK, //knnCollector.k() * DEFAULT_OVER_QUERY_FACTOR,
                         0.0f,
                         0.0f,
                         compatibleBits
                 );
+                //System.out.println("Search completed");
+                //System.out.println("Results count: " + searchResults.getNodes().length);
+                //System.out.println("Visited count: " + searchResults.getVisitedCount());
+
+                int collected = 0;
+                //System.out.println("--- All Results for this Query ---");
                 for (SearchResult.NodeScore ns : searchResults.getNodes()) {
                     knnCollector.collect(ns.node, ns.score);
+                    collected++;
+                    //System.out.println("Result " + collected + ": node=" + ns.node + ", score=" + ns.score); // Print all results here
                 }
+                //System.out.println("--- End Results ---");
+                //System.out.println("Total collected: " + collected);
 //                final int visitedNodesCount = searchResults.getVisitedCount();
 //                final int rerankedCount = searchResults.getRerankedCount();
 
@@ -161,10 +193,10 @@ public class JVectorReader extends KnnVectorsReader {
 
         public FieldEntry(FieldInfo fieldInfo, JVectorWriter.VectorIndexFieldMetadata vectorIndexFieldMetadata) throws IOException {
             this.fieldInfo = fieldInfo;
-//            this.similarityFunction = VectorSimilarityMapper.ordToDistFunc(
-//                    vectorIndexFieldMetadata.getVectorSimilarityFunction().ordinal()
-//            );
-            this.similarityFunction = VectorSimilarityFunction.DOT_PRODUCT;
+            this.similarityFunction = VectorSimilarityMapper.ordToDistFunc(
+                    vectorIndexFieldMetadata.getVectorSimilarityFunction().ordinal()
+            );
+            //this.similarityFunction = VectorSimilarityFunction.DOT_PRODUCT;
             this.vectorEncoding = vectorIndexFieldMetadata.getVectorEncoding();
             this.vectorIndexOffset = vectorIndexFieldMetadata.getVectorIndexOffset();
             this.vectorIndexLength = vectorIndexFieldMetadata.getVectorIndexLength();
@@ -173,6 +205,7 @@ public class JVectorReader extends KnnVectorsReader {
             this.dimension = vectorIndexFieldMetadata.getVectorDimension();
 
             this.vectorIndexFieldFileName = baseDataFileName + "_" + fieldInfo.name + "." + JVectorFormat.VECTOR_INDEX_EXTENSION;
+
 
             // Check the header
             try (IndexInput indexInput = directory.openInput(vectorIndexFieldFileName, state.context)) {
@@ -215,9 +248,10 @@ public class JVectorReader extends KnnVectorsReader {
                     indexInput.seek(vectorIndexOffset + vectorIndexLength);
                     CodecUtil.checkFooter(indexInput);
                 }
-
             }
-
+        }
+        public PQVectors getPqVectors() {
+            return pqVectors;
         }
     }
     public static class VectorSimilarityMapper {

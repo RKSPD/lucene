@@ -26,7 +26,7 @@ public class JVectorFormat extends KnnVectorsFormat {
     private static final int DEFAULT_MAX_CONN = 32;
     private static final int DEFAULT_BEAM_WIDTH = 100;
     private static final float DEFAULT_DEGREE_OVERFLOW = 2f;
-    private static final float DEFAULT_ALPHA = 2f;
+    private static final float DEFAULT_ALPHA = 1.2f;
 
     private final int maxConn;
     private final int beamWidth;
@@ -45,7 +45,7 @@ public class JVectorFormat extends KnnVectorsFormat {
     }
 
     public JVectorFormat(String name, int maxConn, int beamWidth, int minBatchSizeForQuantization) {
-        super(name);
+        super(NAME);
         this.maxConn = maxConn;
         this.beamWidth = beamWidth;
         this.minBatchSizeForQuantization = minBatchSizeForQuantization;

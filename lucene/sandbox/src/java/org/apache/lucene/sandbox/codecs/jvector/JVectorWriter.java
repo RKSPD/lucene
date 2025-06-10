@@ -3,7 +3,10 @@ package org.apache.lucene.sandbox.codecs.jvector;
 import io.github.jbellis.jvector.graph.disk.feature.Feature;
 import io.github.jbellis.jvector.graph.disk.feature.FeatureId;
 import io.github.jbellis.jvector.graph.disk.feature.InlineVectors;
+import io.github.jbellis.jvector.quantization.PQVectors;
+import io.github.jbellis.jvector.vector.types.ByteSequence;
 import org.apache.lucene.codecs.KnnFieldVectorsWriter;
+import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.codecs.KnnVectorsWriter;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.SegmentWriteState;
@@ -29,6 +32,8 @@ import org.apache.lucene.util.RamUsageEstimator;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.util.*;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 
 import static org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsReader.readVectorEncoding;
 
@@ -126,40 +131,321 @@ public class JVectorWriter extends KnnVectorsWriter {
         return newField;
     }
 
+//    @SuppressWarnings("unchecked")
+//    @Override
+//    public void mergeOneField(FieldInfo fieldInfo, MergeState mergeState) throws IOException {
+//        var success = false;
+//        try {
+//            switch (fieldInfo.getVectorEncoding()) {
+//                case BYTE:
+//                    FieldWriter<byte[]> byteWriter = (FieldWriter<byte[]>) addField(fieldInfo);
+//                    ByteVectorValues mergedBytes = MergedVectorValues.mergeByteVectorValues(fieldInfo, mergeState);
+//                    var iterator = mergedBytes.iterator();
+//                    for (int doc = iterator.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = iterator.nextDoc()) {
+//                        byteWriter.addValue(doc, mergedBytes.vectorValue(doc));
+//                    }
+//                    writeField(byteWriter);
+//                    break;
+//                case FLOAT32:
+//                    FieldWriter<float[]> floatVectorFieldWriter = (FieldWriter<float[]>) addField(fieldInfo);
+//                    var mergedFloats = MergedVectorValues.mergeFloatVectorValues(fieldInfo, mergeState);
+//                    var mergeStateIterator = mergedFloats.iterator();
+//                    for (int doc = mergeStateIterator.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = mergeStateIterator.nextDoc()) {
+//                        floatVectorFieldWriter.addValue(doc, mergedFloats.vectorValue(doc));
+//                    }
+//                    writeField(floatVectorFieldWriter);
+//                    break;
+//            }
+//            success = true;
+//        } finally {
+//            if (!success) {
+//                //IOUtils.closeWhileHandlingException(scorerSupplier);
+//            } else {
+//                //IOUtils.close(scorerSupplier);
+//            }
+//        }
+//    }
+
+    /* EXPERIMENTAL --> Quantized Vector Reconstruction On Merge (ForceMerge Fix) */
     @SuppressWarnings("unchecked")
     @Override
     public void mergeOneField(FieldInfo fieldInfo, MergeState mergeState) throws IOException {
         var success = false;
         try {
-            switch (fieldInfo.getVectorEncoding()) {
+            switch(fieldInfo.getVectorEncoding()) {
                 case BYTE:
-                    FieldWriter<byte[]> byteWriter = (FieldWriter<byte[]>) addField(fieldInfo);
-                    ByteVectorValues mergedBytes = MergedVectorValues.mergeByteVectorValues(fieldInfo, mergeState);
-                    var iterator = mergedBytes.iterator();
-                    for (int doc = iterator.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = iterator.nextDoc()) {
-                        byteWriter.addValue(doc, mergedBytes.vectorValue(doc));
-                    }
-                    writeField(byteWriter);
-                    break;
+                    throw new UnsupportedOperationException("Byte vectors are not supported in JVector. ");
                 case FLOAT32:
                     FieldWriter<float[]> floatVectorFieldWriter = (FieldWriter<float[]>) addField(fieldInfo);
-                    var mergedFloats = MergedVectorValues.mergeFloatVectorValues(fieldInfo, mergeState);
-                    var mergeStateIterator = mergedFloats.iterator();
-                    for (int doc = mergeStateIterator.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = mergeStateIterator.nextDoc()) {
-                        floatVectorFieldWriter.addValue(doc, mergedFloats.vectorValue(doc));
+
+                    boolean hasQuantizedSources = false;
+                    List<QuantizedSegmentInfo> quantizedSegments = new ArrayList<>();
+
+                    for (int i = 0; i < mergeState.knnVectorsReaders.length; i++) {
+                        if(mergeState.knnVectorsReaders[i] instanceof JVectorReader) {
+                            JVectorReader reader = (JVectorReader) mergeState.knnVectorsReaders[i];
+                            JVectorReader.FieldEntry fieldEntry = reader.getFieldEntryMap().get(fieldInfo.name);
+
+                            if (fieldEntry != null) {
+                                PQVectors pqv = fieldEntry.getPqVectors();
+                                if (pqv != null) {
+                                    hasQuantizedSources = true;
+                                    quantizedSegments.add(new QuantizedSegmentInfo(
+                                            i,
+                                            fieldEntry.getPqVectors(),
+                                            mergeState.docMaps[i]
+                                    ));
+                                }
+
+                            }
+                        }
                     }
+                    if (hasQuantizedSources) {
+                        mergeQuantizedVectors(floatVectorFieldWriter, fieldInfo, mergeState, quantizedSegments);
+                    } else {
+                        var mergedFloats = MergedVectorValues.mergeFloatVectorValues(fieldInfo, mergeState);
+                        var mergeStateIterator = mergedFloats.iterator();
+                        for (int doc = mergeStateIterator.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = mergeStateIterator.nextDoc()) {
+                            floatVectorFieldWriter.addValue(doc, mergedFloats.vectorValue(doc));
+                        }
+                    }
+
                     writeField(floatVectorFieldWriter);
                     break;
             }
             success = true;
         } finally {
-            if (!success) {
-                //IOUtils.closeWhileHandlingException(scorerSupplier);
-            } else {
-                //IOUtils.close(scorerSupplier);
+            if (!success) { /* CLEAN UP */ }
+        }
+    }
+    private void mergeQuantizedVectors(
+            FieldWriter<float[]> writer,
+            FieldInfo fieldInfo,
+            MergeState mergeState,
+            List<QuantizedSegmentInfo> quantizedSegments
+    ) throws IOException {
+        for (int segmentIndex = 0; segmentIndex < mergeState.knnVectorsReaders.length; segmentIndex++) {
+            KnnVectorsReader reader = mergeState.knnVectorsReaders[segmentIndex];
+            FloatVectorValues vectorValues = reader.getFloatVectorValues(fieldInfo.name);
+
+            if (vectorValues != null) {
+                int finalSegmentIndex = segmentIndex;
+                QuantizedSegmentInfo quantizedInfo = quantizedSegments.stream()
+                        .filter(q -> q.segmentIndex == finalSegmentIndex)
+                        .findFirst()
+                        .orElse(null);
+
+                var iterator = vectorValues.iterator();
+                for (int sourceDoc = iterator.nextDoc();
+                     sourceDoc != DocIdSetIterator.NO_MORE_DOCS;
+                     sourceDoc = iterator.nextDoc()) {
+
+                    float[] vector;
+                    if (quantizedInfo != null) {
+                        // Use reflection-based reconstruct:
+                        vector = reconstructVectorFromPQ(quantizedInfo.pqVectors, sourceDoc);
+                    } else {
+                        vector = vectorValues.vectorValue(sourceDoc);
+                    }
+                    int newDocId = quantizedInfo == null
+                            ? mergeState.docMaps[segmentIndex].get(sourceDoc)
+                            : quantizedInfo.docMap.get(sourceDoc);
+                    if (newDocId != -1) {
+                        writer.addValue(newDocId, vector);
+                    }
+                }
             }
         }
     }
+
+    @SuppressWarnings("unchecked")
+    private float[] reconstructVectorFromPQ(PQVectors pqVectors, int ordinal) throws IOException {
+        try {
+            // 1) Get the PQ instance
+            ProductQuantization pq = pqVectors.getCompressor();
+
+            // 2) dimensionality
+            Field dimField = pq.getClass().getDeclaredField("originalDimension");
+            dimField.setAccessible(true);
+            int dim = dimField.getInt(pq);
+            float[] reconstructed = new float[dim];
+
+            // 3) get the raw PQ bytes
+            ByteSequence<?> codes = pqVectors.get(ordinal);
+            int M = codes.length();  // number of subspaces
+
+            // 4) subspace sizes & offsets
+            Field ssoField = pq.getClass().getDeclaredField("subvectorSizesAndOffsets");
+            ssoField.setAccessible(true);
+            int[][] sizesAndOffsets = (int[][]) ssoField.get(pq);
+
+            // 5) the codebooks field (could be float[][] or VectorFloat[][])
+            Field cbField = pq.getClass().getDeclaredField("codebooks");
+            cbField.setAccessible(true);
+            Object codebooksObj = cbField.get(pq);
+
+            // 6) Handle different codebook formats:
+            if (codebooksObj instanceof float[][]) {
+                // --- old style: 2D float array
+                float[][] codebooks = (float[][]) codebooksObj;
+                for (int m = 0; m < M; m++) {
+                    int codeIndex = Byte.toUnsignedInt(codes.get(m));
+                    int subDim    = sizesAndOffsets[m][0];
+                    int subOff    = sizesAndOffsets[m][1];
+                    float[] cb    = codebooks[m];
+                    int k         = cb.length / subDim;
+                    if (codeIndex < 0 || codeIndex >= k) {
+                        throw new IOException("PQ code out of range: subspace=" + m + " code=" + codeIndex + " but k=" + k);
+                    }
+                    System.arraycopy(cb, codeIndex * subDim, reconstructed, subOff, subDim);
+                }
+
+            } else if (codebooksObj.getClass().isArray() &&
+                    codebooksObj.getClass().getComponentType().getName().contains("VectorFloat")) {
+                // --- new style: VectorFloat[] array where each VectorFloat contains k contiguous subvectors
+                // Based on JVector source: "array of codebooks, where each codebook is a VectorFloat consisting of k contiguous subvectors each of length M"
+                Object[] codebooks = (Object[]) codebooksObj;
+
+                // Each codebook (VectorFloat) contains all centroids for one subspace
+                if (codebooks.length != M) {
+                    throw new IOException("Expected " + M + " codebooks (one per subspace), but found " + codebooks.length);
+                }
+
+                for (int m = 0; m < M; m++) {
+                    int codeIndex = Byte.toUnsignedInt(codes.get(m));
+                    int subDim    = sizesAndOffsets[m][0];
+                    int subOff    = sizesAndOffsets[m][1];
+
+                    Object codebookVec = codebooks[m];
+                    float[] codebookData = extractFloatArrayFromVectorFloat(codebookVec, -1); // -1 means we don't know the exact size
+
+                    // Each codebook contains k centroids, each of size subDim
+                    int k = codebookData.length / subDim;
+                    if (codeIndex < 0 || codeIndex >= k) {
+                        throw new IOException("PQ code out of range: subspace=" + m + " code=" + codeIndex + " but k=" + k);
+                    }
+
+                    // Extract the specific centroid from the codebook
+                    int centroidOffset = codeIndex * subDim;
+                    if (centroidOffset + subDim > codebookData.length) {
+                        throw new IOException("Centroid offset out of bounds for subspace " + m);
+                    }
+
+                    System.arraycopy(codebookData, centroidOffset, reconstructed, subOff, subDim);
+                }
+
+            } else if (codebooksObj.getClass().isArray() &&
+                    codebooksObj.getClass().getComponentType().isArray() &&
+                    codebooksObj.getClass().getComponentType().getComponentType().getName().contains("VectorFloat")) {
+                // --- new style: 2D VectorFloat array
+                Object[][] codebooks = (Object[][]) codebooksObj;
+                for (int m = 0; m < M; m++) {
+                    int codeIndex = Byte.toUnsignedInt(codes.get(m));
+                    int subDim    = sizesAndOffsets[m][0];
+                    int subOff    = sizesAndOffsets[m][1];
+
+                    if (codeIndex < 0 || codeIndex >= codebooks[m].length) {
+                        throw new IOException("PQ code out of range: subspace=" + m + " code=" + codeIndex + " but k=" + codebooks[m].length);
+                    }
+
+                    Object centroidVec = codebooks[m][codeIndex];
+                    float[] centroid = extractFloatArrayFromVectorFloat(centroidVec, subDim);
+                    if (centroid.length != subDim) {
+                        throw new IOException("Centroid length mismatch for subspace " + m + ": expected " + subDim + ", got " + centroid.length);
+                    }
+                    System.arraycopy(centroid, 0, reconstructed, subOff, subDim);
+                }
+
+            } else {
+                throw new IOException("Unexpected codebooks type: " + codebooksObj.getClass() +
+                        " (component type: " + (codebooksObj.getClass().isArray() ?
+                        codebooksObj.getClass().getComponentType() : "not an array") + ")");
+            }
+
+            // 7) add back global centroid if present
+            Field gcField = pq.getClass().getDeclaredField("globalCentroid");
+            gcField.setAccessible(true);
+            Object gcObj = gcField.get(pq);
+            if (gcObj instanceof float[] gcArr) {
+                for (int i = 0; i < dim; i++) {
+                    reconstructed[i] += gcArr[i];
+                }
+            }
+
+            return reconstructed;
+
+        } catch (ReflectiveOperationException e) {
+            throw new IOException("Failed to reconstruct PQ vector via reflection", e);
+        }
+    }
+
+    // Helper method to extract float array from VectorFloat object
+    private float[] extractFloatArrayFromVectorFloat(Object vectorFloat, int expectedSize) throws IOException {
+        try {
+            // Try to get the underlying float array using reflection
+            Class<?> vectorClass = vectorFloat.getClass();
+
+            // Common field names for the underlying array
+            String[] possibleFieldNames = {"data", "array", "values", "vector", "elements"};
+
+            for (String fieldName : possibleFieldNames) {
+                try {
+                    Field field = vectorClass.getDeclaredField(fieldName);
+                    field.setAccessible(true);
+                    Object fieldValue = field.get(vectorFloat);
+                    if (fieldValue instanceof float[]) {
+                        float[] result = (float[]) fieldValue;
+                        if (expectedSize > 0 && result.length != expectedSize) {
+                            throw new IOException("Vector length mismatch: expected " + expectedSize + ", got " + result.length);
+                        }
+                        return result;
+                    }
+                } catch (NoSuchFieldException | IllegalAccessException e) {
+                    // Try next field name
+                    continue;
+                }
+            }
+
+            // If direct field access fails, try method-based access
+            String[] possibleMethodNames = {"toArray", "asArray", "getArray", "data", "values"};
+
+            for (String methodName : possibleMethodNames) {
+                try {
+                    Method method = vectorClass.getMethod(methodName);
+                    Object result = method.invoke(vectorFloat);
+                    if (result instanceof float[]) {
+                        float[] floatResult = (float[]) result;
+                        if (expectedSize > 0 && floatResult.length != expectedSize) {
+                            throw new IOException("Vector length mismatch: expected " + expectedSize + ", got " + floatResult.length);
+                        }
+                        return floatResult;
+                    }
+                } catch (NoSuchMethodException | IllegalAccessException | java.lang.reflect.InvocationTargetException e) {
+                    // Try next method name
+                    continue;
+                }
+            }
+
+            throw new IOException("Could not extract float array from VectorFloat object of type: " + vectorClass.getName());
+
+        } catch (Exception e) {
+            throw new IOException("Failed to extract float array from VectorFloat", e);
+        }
+    }
+
+    private static class QuantizedSegmentInfo {
+        final int segmentIndex;
+        final PQVectors pqVectors;
+        final MergeState.DocMap docMap;
+
+        QuantizedSegmentInfo(int segmentIndex, PQVectors pqVectors, MergeState.DocMap docMap) {
+            this.segmentIndex = segmentIndex;
+            this.pqVectors = pqVectors;
+            this.docMap = docMap;
+        }
+    }
+
+    /* END EXPERIMENTAL FORCEMERGE FIX */
 
     @Override
     public void flush(int maxDoc, Sorter.DocMap sortMap) throws IOException {
@@ -223,10 +509,26 @@ public class JVectorWriter extends KnnVectorsWriter {
                     .withStartOffset(startOffset)
                     .build();
 
+            int expectedNodes = graph.size(0);
+            int availableVectors = fieldData.randomAccessVectorValues.size();
+            if (expectedNodes != availableVectors) {
+                throw new IllegalStateException("Graph nodes (" + expectedNodes + ") != available vectors (" + availableVectors + ")");
+            }
+            // Pre-load all vectors to ensure consistency
+            Map<Integer, VectorFloat<?>> vectorCache = new HashMap<>();
+            for (int i = 0; i < fieldData.randomAccessVectorValues.size(); i++) {
+                vectorCache.put(i, fieldData.randomAccessVectorValues.getVector(i));
+            }
+
             var suppliers = Feature.singleStateFactory(
                     FeatureId.INLINE_VECTORS,
-                    nodeId -> new InlineVectors.State(fieldData.randomAccessVectorValues.getVector(nodeId))
+                    nodeId -> new InlineVectors.State(vectorCache.get(nodeId))
             );
+
+//            var suppliers = Feature.singleStateFactory(
+//                    FeatureId.INLINE_VECTORS,
+//                    nodeId -> new InlineVectors.State(fieldData.randomAccessVectorValues.getVector(nodeId))
+//            );
 
             writer.write(suppliers);
 
@@ -247,8 +549,8 @@ public class JVectorWriter extends KnnVectorsWriter {
             return new VectorIndexFieldMetadata(
                     fieldData.fieldInfo.number,
                     fieldData.fieldInfo.getVectorEncoding(),
-                    VectorSimilarityFunction.DOT_PRODUCT,
-                    //fieldData.fieldInfo.getVectorSimilarityFunction(),
+                    //VectorSimilarityFunction.DOT_PRODUCT,
+                    fieldData.fieldInfo.getVectorSimilarityFunction(),
                     fieldData.randomAccessVectorValues.dimension(),
                     startOffset,
                     endGraphOffset - startOffset,
@@ -271,13 +573,13 @@ public class JVectorWriter extends KnnVectorsWriter {
     private static void writePQCodebooksAndVectors(DataOutput out, FieldWriter<?> fieldData) throws IOException {
 
         // TODO: should we make this configurable?
-        // Compress the original vectors using PQ. this represents a compression ratio of 128 * 4 / 16 = 32x
         //final var M = Math.min(fieldData.randomAccessVectorValues.dimension(), 32); // number of subspaces
-        final int M = 8;
+        // TODO: test M = 96, 64, 48, 32, 16
+        final int M = 64;
         //final var numberOfClustersPerSubspace = Math.min(1024, fieldData.randomAccessVectorValues.size()); // number of centroids per
         // subspace
 
-        final int numberOfClustersPerSubspace = fieldData.randomAccessVectorValues.size();
+        final int numberOfClustersPerSubspace = 256; //fieldData.randomAccessVectorValues.size();
         ProductQuantization pq = ProductQuantization.compute(
                 fieldData.randomAccessVectorValues,
                 M, // number of subspaces
@@ -471,17 +773,17 @@ public class JVectorWriter extends KnnVectorsWriter {
         }
 
         io.github.jbellis.jvector.vector.VectorSimilarityFunction getVectorSimilarityFunction(FieldInfo fieldInfo) {
-//            switch (fieldInfo.getVectorSimilarityFunction()) {
-//                case EUCLIDEAN:
-//                    return io.github.jbellis.jvector.vector.VectorSimilarityFunction.EUCLIDEAN;
-//                case COSINE:
-//                    return io.github.jbellis.jvector.vector.VectorSimilarityFunction.COSINE;
-//                case DOT_PRODUCT:
-//                    return io.github.jbellis.jvector.vector.VectorSimilarityFunction.DOT_PRODUCT;
-//                default:
-//                    throw new IllegalArgumentException("Unsupported similarity function: " + fieldInfo.getVectorSimilarityFunction());
-//            }
-            return io.github.jbellis.jvector.vector.VectorSimilarityFunction.DOT_PRODUCT;
+            switch (fieldInfo.getVectorSimilarityFunction()) {
+                case EUCLIDEAN:
+                    return io.github.jbellis.jvector.vector.VectorSimilarityFunction.EUCLIDEAN;
+                case COSINE:
+                    return io.github.jbellis.jvector.vector.VectorSimilarityFunction.COSINE;
+                case DOT_PRODUCT:
+                    return io.github.jbellis.jvector.vector.VectorSimilarityFunction.DOT_PRODUCT;
+                default:
+                    throw new IllegalArgumentException("Unsupported similarity function: " + fieldInfo.getVectorSimilarityFunction());
+            }
+            //return io.github.jbellis.jvector.vector.VectorSimilarityFunction.DOT_PRODUCT;
         }
 
         /**
