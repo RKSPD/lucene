@@ -637,10 +637,7 @@ public class JVectorWriter extends KnnVectorsWriter {
         //final var M = Math.min(fieldData.randomAccessVectorValues.dimension(), 32); // number of subspaces
         // TODO: test M = 96, 64, 48, 32, 16
         final int M = 64;
-        //final var numberOfClustersPerSubspace = Math.min(1024, fieldData.randomAccessVectorValues.size()); // number of centroids per
-        // subspace
-
-        final int numberOfClustersPerSubspace = 256; //fieldData.randomAccessVectorValues.size();
+        final int numberOfClustersPerSubspace = 256;
         ProductQuantization pq = ProductQuantization.compute(
                 fieldData.randomAccessVectorValues,
                 M, // number of subspaces

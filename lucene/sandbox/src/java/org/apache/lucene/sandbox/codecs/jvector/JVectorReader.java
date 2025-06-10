@@ -85,7 +85,7 @@ public class JVectorReader extends KnnVectorsReader {
     }
 
     private int calculateRerankK(int k, int graphSize) {
-        return graphSize / k;
+        return k * 4;
     }
 
 
