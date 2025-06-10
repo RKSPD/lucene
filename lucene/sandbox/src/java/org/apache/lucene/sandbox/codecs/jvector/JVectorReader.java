@@ -28,8 +28,6 @@ import java.util.Map;
 // ----------- SKELETON -------------
 public class JVectorReader extends KnnVectorsReader {
     private static final VectorTypeSupport VECTOR_TYPE_SUPPORT = VectorizationProvider.getInstance().getVectorTypeSupport();
-    private static final int DEFAULT_OVER_QUERY_FACTOR = 50;
-
     private final FieldInfos fieldInfos;
     private final String baseDataFileName;
     private final Map<String, FieldEntry> fieldEntryMap = new HashMap<>(1);
@@ -87,15 +85,12 @@ public class JVectorReader extends KnnVectorsReader {
     }
 
     private int calculateRerankK(int k, int graphSize) {
-        int targetRerank = 50000;
-        // Never ask for more candidates than exist in the dataset
-        return Math.min(targetRerank, graphSize);
+        return graphSize / k;
     }
 
 
     @Override
     public void search(String field, float[] target, KnnCollector knnCollector, Bits acceptDocs) throws IOException {
-        acceptDocs = null;
         final OnDiskGraphIndex index = fieldEntryMap.get(field).index;
         //System.out.println("DEBUG SEARCH: Index size as seen by search method: " + index.size(0)); // <--- ADD THIS LINE
         VectorFloat<?> q = VECTOR_TYPE_SUPPORT.createFloatVector(target);
@@ -118,11 +113,8 @@ public class JVectorReader extends KnnVectorsReader {
                 //System.out.println("NOT USING PQ VECTORS ⚠️");
                 ssp = SearchScoreProvider.exact(q, fieldEntryMap.get(field).similarityFunction, view);
             }
-            Bits finalAcceptDocs = acceptDocs;
-            if(acceptDocs == null) {
-                //System.out.println("ACCEPT DOCS IS NULL");
-            }
-            io.github.jbellis.jvector.util.Bits compatibleBits = doc -> finalAcceptDocs == null || finalAcceptDocs.get(doc);
+
+            io.github.jbellis.jvector.util.Bits compatibleBits = doc -> acceptDocs == null || acceptDocs.get(doc);
             try (var graphSearcher = new GraphSearcher(index)) {
                 //System.out.println("Graph searcher created successfully 👍🏾");
                 int reRankK = calculateRerankK(knnCollector.k(), index.size(0));
@@ -135,9 +127,6 @@ public class JVectorReader extends KnnVectorsReader {
                         0.0f,
                         compatibleBits
                 );
-                //System.out.println("Search completed");
-                //System.out.println("Results count: " + searchResults.getNodes().length);
-                //System.out.println("Visited count: " + searchResults.getVisitedCount());
 
                 int collected = 0;
                 //System.out.println("--- All Results for this Query ---");

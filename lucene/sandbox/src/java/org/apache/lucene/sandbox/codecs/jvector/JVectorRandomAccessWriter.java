@@ -130,7 +130,7 @@ public class JVectorRandomAccessWriter implements RandomAccessWriter {
 
     public JVectorRandomAccessWriter(IndexOutput indexOutputDelegate) {
         this.indexOutputDelegate = indexOutputDelegate;
-        System.out.println("🟢 JVectorRandomAccessWriter: Created with IndexOutput: " + indexOutputDelegate);
+        //System.out.println("🟢 JVectorRandomAccessWriter: Created with IndexOutput: " + indexOutputDelegate);
     }
 
     @Override

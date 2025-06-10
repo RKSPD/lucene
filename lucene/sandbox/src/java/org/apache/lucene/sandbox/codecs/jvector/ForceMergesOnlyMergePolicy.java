@@ -23,6 +23,7 @@ public class ForceMergesOnlyMergePolicy extends MergePolicy {
 
     public ForceMergesOnlyMergePolicy(boolean useCompoundFile) {
         super();
+        System.out.println("USING FORCESONLY MERGEPOLICY 😈");
         this.useCompoundFile = useCompoundFile;
     }
 

@@ -1,5 +1,6 @@
 package org.apache.lucene.sandbox.codecs.jvector;
 
+import io.github.jbellis.jvector.graph.*;
 import io.github.jbellis.jvector.graph.disk.feature.Feature;
 import io.github.jbellis.jvector.graph.disk.feature.FeatureId;
 import io.github.jbellis.jvector.graph.disk.feature.InlineVectors;
@@ -12,10 +13,6 @@ import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.SegmentWriteState;
 import org.apache.lucene.index.Sorter;
 
-import io.github.jbellis.jvector.graph.GraphIndexBuilder;
-import io.github.jbellis.jvector.graph.ListRandomAccessVectorValues;
-import io.github.jbellis.jvector.graph.OnHeapGraphIndex;
-import io.github.jbellis.jvector.graph.RandomAccessVectorValues;
 import io.github.jbellis.jvector.graph.disk.*;
 import io.github.jbellis.jvector.graph.similarity.BuildScoreProvider;
 import io.github.jbellis.jvector.quantization.ProductQuantization;
@@ -167,55 +164,113 @@ public class JVectorWriter extends KnnVectorsWriter {
 //    }
 
     /* EXPERIMENTAL --> Quantized Vector Reconstruction On Merge (ForceMerge Fix) */
+//    @SuppressWarnings("unchecked")
+//    @Override
+//    public void mergeOneField(FieldInfo fieldInfo, MergeState mergeState) throws IOException {
+//        var success = false;
+//        try {
+//            switch(fieldInfo.getVectorEncoding()) {
+//                case BYTE:
+//                    throw new UnsupportedOperationException("Byte vectors are not supported in JVector. ");
+//                case FLOAT32:
+//                    FieldWriter<float[]> floatVectorFieldWriter = (FieldWriter<float[]>) addField(fieldInfo);
+//
+//                    boolean hasQuantizedSources = false;
+//                    List<QuantizedSegmentInfo> quantizedSegments = new ArrayList<>();
+//
+//                    for (int i = 0; i < mergeState.knnVectorsReaders.length; i++) {
+//                        if(mergeState.knnVectorsReaders[i] instanceof JVectorReader) {
+//                            JVectorReader reader = (JVectorReader) mergeState.knnVectorsReaders[i];
+//                            JVectorReader.FieldEntry fieldEntry = reader.getFieldEntryMap().get(fieldInfo.name);
+//
+//                            if (fieldEntry != null) {
+//                                PQVectors pqv = fieldEntry.getPqVectors();
+//                                if (pqv != null) {
+//                                    hasQuantizedSources = true;
+//                                    quantizedSegments.add(new QuantizedSegmentInfo(
+//                                            i,
+//                                            fieldEntry.getPqVectors(),
+//                                            mergeState.docMaps[i]
+//                                    ));
+//                                }
+//
+//                            }
+//                        }
+//                    }
+//                    if (hasQuantizedSources) {
+//                        mergeQuantizedVectors(floatVectorFieldWriter, fieldInfo, mergeState, quantizedSegments);
+//                    } else {
+//                        var mergedFloats = MergedVectorValues.mergeFloatVectorValues(fieldInfo, mergeState);
+//                        var mergeStateIterator = mergedFloats.iterator();
+//                        for (int doc = mergeStateIterator.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = mergeStateIterator.nextDoc()) {
+//                            floatVectorFieldWriter.addValue(doc, mergedFloats.vectorValue(doc));
+//                        }
+//                    }
+//
+//                    writeField(floatVectorFieldWriter);
+//                    break;
+//            }
+//            success = true;
+//        } finally {
+//            if (!success) { /* CLEAN UP */ }
+//        }
+//    }
     @SuppressWarnings("unchecked")
     @Override
     public void mergeOneField(FieldInfo fieldInfo, MergeState mergeState) throws IOException {
+        System.out.println("Called MERGE 🚗");
+        //log.info("Merging field {} into segment {}", fieldInfo.name, segmentWriteState.segmentInfo.name);
         var success = false;
         try {
-            switch(fieldInfo.getVectorEncoding()) {
+            switch (fieldInfo.getVectorEncoding()) {
                 case BYTE:
-                    throw new UnsupportedOperationException("Byte vectors are not supported in JVector. ");
+                    throw new UnsupportedOperationException("Byte vectors are not supported");
                 case FLOAT32:
                     FieldWriter<float[]> floatVectorFieldWriter = (FieldWriter<float[]>) addField(fieldInfo);
 
+                    // Check if any of the segments being merged have quantized vectors
                     boolean hasQuantizedSources = false;
                     List<QuantizedSegmentInfo> quantizedSegments = new ArrayList<>();
 
                     for (int i = 0; i < mergeState.knnVectorsReaders.length; i++) {
-                        if(mergeState.knnVectorsReaders[i] instanceof JVectorReader) {
+                        if (mergeState.knnVectorsReaders[i] instanceof JVectorReader) {
                             JVectorReader reader = (JVectorReader) mergeState.knnVectorsReaders[i];
                             JVectorReader.FieldEntry fieldEntry = reader.getFieldEntryMap().get(fieldInfo.name);
 
-                            if (fieldEntry != null) {
-                                PQVectors pqv = fieldEntry.getPqVectors();
-                                if (pqv != null) {
-                                    hasQuantizedSources = true;
-                                    quantizedSegments.add(new QuantizedSegmentInfo(
-                                            i,
-                                            fieldEntry.getPqVectors(),
-                                            mergeState.docMaps[i]
-                                    ));
-                                }
-
+                            if (fieldEntry != null && fieldEntry.getPqVectors() != null) {
+                                hasQuantizedSources = true;
+                                quantizedSegments.add(new QuantizedSegmentInfo(
+                                        i,
+                                        fieldEntry.getPqVectors(),
+                                        mergeState.docMaps[i]
+                                ));
                             }
                         }
                     }
+
                     if (hasQuantizedSources) {
+                        //log.info("Merging quantized vectors for field {}", fieldInfo.name);
                         mergeQuantizedVectors(floatVectorFieldWriter, fieldInfo, mergeState, quantizedSegments);
                     } else {
                         var mergedFloats = MergedVectorValues.mergeFloatVectorValues(fieldInfo, mergeState);
                         var mergeStateIterator = mergedFloats.iterator();
+                        int vectorCount = 0;
                         for (int doc = mergeStateIterator.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = mergeStateIterator.nextDoc()) {
                             floatVectorFieldWriter.addValue(doc, mergedFloats.vectorValue(doc));
+                            vectorCount++;
                         }
+                        System.out.println("Merged { " + vectorCount + " } non-quantized vectors for field { " + fieldInfo.name + " }");
                     }
 
                     writeField(floatVectorFieldWriter);
                     break;
             }
             success = true;
+            System.out.println("Completed Merge field { " + fieldInfo.name + " } into segment { " + segmentWriteState.segmentInfo.name + " }");
         } finally {
-            if (!success) { /* CLEAN UP */ }
+            if (!success) {
+                System.out.println("Failed to merge field {" + fieldInfo.name + " } into segment {" + segmentWriteState.segmentInfo.name + " }");
+            }
         }
     }
     private void mergeQuantizedVectors(
@@ -462,6 +517,13 @@ public class JVectorWriter extends KnnVectorsWriter {
 
     private void writeField(FieldWriter<?> fieldData) throws IOException {
         OnHeapGraphIndex graph = fieldData.getGraph();
+
+        int nodeCount = graph.size(0);
+        int maxLevel = graph.getMaxLevel();
+        double avgDegree = graph.getAverageDegree(0);
+
+        System.out.println("Graph metrics: \nNode Count: " + nodeCount + "\nMax Level: " + maxLevel + "\nAvg Degree: " + avgDegree);
+
         final var vectorIndexFieldMetadata = writeGraph(graph, fieldData);
         meta.writeInt(fieldData.fieldInfo.number);
         vectorIndexFieldMetadata.toOutput(meta);
@@ -503,7 +565,6 @@ public class JVectorWriter extends KnnVectorsWriter {
 
             System.out.println("Writing graph to " + vectorIndexFieldFileName);
 
-            // Direct constructor of OnDiskGraphIndexWriter (no builder)
             var writer = new OnDiskGraphIndexWriter.Builder(graph, randomAccessWriter)
                     .with(new InlineVectors(fieldData.randomAccessVectorValues.dimension()))
                     .withStartOffset(startOffset)
@@ -734,13 +795,13 @@ public class JVectorWriter extends KnnVectorsWriter {
                     beamWidth,
                     degreeOverflow,
                     alpha,
-                    false
+                    true
             );
         }
 
         @Override
         public void addValue(int docID, T vectorValue) throws IOException {
-            if (docID == lastDocID) {
+            if (docID <= lastDocID) {
                 throw new IllegalArgumentException(
                         "VectorValuesField \""
                                 + fieldInfo.name
@@ -792,8 +853,11 @@ public class JVectorWriter extends KnnVectorsWriter {
          * @throws IOException IOException
          */
         public OnHeapGraphIndex getGraph() throws IOException {
+            System.out.println("Building graph index for field " + fieldInfo.name + " and " + floatVectors.size() + " vectors");
             graphIndexBuilder.cleanup();
-            return graphIndexBuilder.getGraph();
+            OnHeapGraphIndex graph = graphIndexBuilder.getGraph();
+            System.out.println("Built graph for field " + fieldInfo.name + " and " + graph.size(0));
+            return graph;
         }
     }
 }
