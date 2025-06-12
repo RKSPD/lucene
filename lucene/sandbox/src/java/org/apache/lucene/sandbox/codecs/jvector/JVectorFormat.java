@@ -66,4 +66,19 @@ public class JVectorFormat extends KnnVectorsFormat {
     public int getMaxDimensions(String dim) {
         return 8192;
     }
+
+    public static int getDefaultNumberOfSubspacesPerVector(int originalDimension) {
+        int compressedBytes;
+        if (originalDimension <= 32) {
+            compressedBytes = originalDimension;
+        } else if (originalDimension <= 64) {
+            compressedBytes = 32;
+        } else if (originalDimension <= 200) {
+            compressedBytes = (int) (originalDimension * 0.5);
+        } else if (originalDimension <= 400) {
+            compressedBytes = 100;
+        } else if (originalDimension <= 768) {
+            compressedBytes = (int) (originalDimension * 0.25);
+        } else if
+    }
 }
