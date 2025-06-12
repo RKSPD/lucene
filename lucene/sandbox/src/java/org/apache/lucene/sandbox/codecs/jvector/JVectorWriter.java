@@ -315,6 +315,7 @@ public class JVectorWriter extends KnnVectorsWriter {
 
     @SuppressWarnings("unchecked")
     private float[] reconstructVectorFromPQ(PQVectors pqVectors, int ordinal) throws IOException {
+        System.out.println("RECONSTRUCTING VECTOR FROM PQ 🥒");
         try {
             // 1) Get the PQ instance
             ProductQuantization pq = pqVectors.getCompressor();
@@ -637,7 +638,7 @@ public class JVectorWriter extends KnnVectorsWriter {
         //final var M = Math.min(fieldData.randomAccessVectorValues.dimension(), 32); // number of subspaces
         // TODO: test M = 96, 64, 48, 32, 16
         final int M = 64;
-        final int numberOfClustersPerSubspace = 256;
+        final int numberOfClustersPerSubspace = Math.min(256,  fieldData.randomAccessVectorValues.size());
         ProductQuantization pq = ProductQuantization.compute(
                 fieldData.randomAccessVectorValues,
                 M, // number of subspaces
