@@ -1015,7 +1015,8 @@ public final class Lucene104PostingsReader extends PostingsReaderBase {
               int sourceTo = Math.min(upTo, level0LastDocID + 1) - docBitSetBase;
 
               if (sourceTo > sourceFrom) {
-                FixedBitSet.orRange(docBitSet, sourceFrom, bitSet, destFrom, sourceTo - sourceFrom);
+                orBitsInline(
+                    docBitSet.getBits(), sourceFrom, bitSet.getBits(), destFrom, sourceTo - sourceFrom);
               }
               if (docBitSetBase + sourceTo <= level0LastDocID) {
                 // We stopped before the end of the current bit set, which means that we're done.
@@ -1089,10 +1090,175 @@ public final class Lucene104PostingsReader extends PostingsReaderBase {
 
     private void bufferIntoBitSet(int start, int end, FixedBitSet bitSet, int offset)
         throws IOException {
-      // bitSet#set and `doc - offset` get auto-vectorized
-      for (int i = start; i < end; ++i) {
-        int doc = docBuffer[i];
-        bitSet.set(doc - offset);
+      // 4-stream interleave: split the buffer into quarters and process them
+      // simultaneously. The 4 independent read-modify-write chains overlap
+      // store-to-load forwarding latency and eliminate the data-dependent
+      // word-change branch that mispredicts ~every 6th iteration at low selectivity.
+      long[] bits = bitSet.getBits();
+      int[] docs = docBuffer;
+      int count = end - start;
+      int q = count >>> 2;
+      int s1 = start + q, s2 = start + 2 * q, s3 = start + 3 * q;
+      for (int i = 0; i < q; ++i) {
+        int p0 = docs[start + i] - offset;
+        int p1 = docs[s1 + i] - offset;
+        int p2 = docs[s2 + i] - offset;
+        int p3 = docs[s3 + i] - offset;
+        bits[p0 >>> 6] |= 1L << p0;
+        bits[p1 >>> 6] |= 1L << p1;
+        bits[p2 >>> 6] |= 1L << p2;
+        bits[p3 >>> 6] |= 1L << p3;
+      }
+      for (int i = start + 4 * q; i < end; ++i) {
+        int p = docs[i] - offset;
+        bits[p >>> 6] |= 1L << p;
+      }
+    }
+
+    /**
+     * OR {@code length} bits from {@code src} at bit position {@code srcFrom} into {@code dst} at
+     * bit position {@code dstFrom}. Same semantics as {@link FixedBitSet#orRange} but without
+     * bounds checks or method-call overhead — called in the UNARY intoBitSet hot path where the
+     * caller guarantees valid ranges.
+     */
+    private static void orBitsInline(long[] src, int srcFrom, long[] dst, int dstFrom, int length) {
+      // Align dstFrom to a word boundary
+      if ((dstFrom & 0x3F) != 0) {
+        int dstBit = dstFrom & 0x3F;
+        int srcBit = srcFrom & 0x3F;
+        int head = Math.min(Long.SIZE - dstBit, length);
+        long bits = src[srcFrom >>> 6] >>> srcBit;
+        if (head > Long.SIZE - srcBit) {
+          bits |= src[(srcFrom >>> 6) + 1] << (Long.SIZE - srcBit);
+        }
+        dst[dstFrom >>> 6] |= (bits & ((1L << head) - 1)) << dstBit;
+        srcFrom += head;
+        dstFrom += head;
+        length -= head;
+      }
+      if (length == 0) return;
+
+      // Bulk word-level OR with dest aligned
+      int numWords = length >>> 6;
+      int dstWord = dstFrom >>> 6;
+      int srcWord = srcFrom >>> 6;
+      int srcBit = srcFrom & 0x3F;
+
+      if (srcBit == 0) {
+        for (int i = 0; i < numWords; ++i) {
+          dst[dstWord + i] |= src[srcWord + i];
+        }
+      } else {
+        int invSrcBit = Long.SIZE - srcBit;
+        for (int i = 0; i < numWords; ++i) {
+          dst[dstWord + i] |= (src[srcWord + i] >>> srcBit) | (src[srcWord + i + 1] << invSrcBit);
+        }
+      }
+
+      // Tail bits
+      length &= 0x3F;
+      if (length > 0) {
+        srcFrom += numWords << 6;
+        dstFrom += numWords << 6;
+        int sb = srcFrom & 0x3F;
+        long bits = src[srcFrom >>> 6] >>> sb;
+        if (length > Long.SIZE - sb) {
+          bits |= src[(srcFrom >>> 6) + 1] << (Long.SIZE - sb);
+        }
+        dst[dstFrom >>> 6] |= bits & ((1L << length) - 1);
+      }
+    }
+
+    @Override
+    public void andIntoBitSet(int upTo, FixedBitSet bitSet, FixedBitSet scratch, int offset)
+        throws IOException {
+      if (doc >= upTo) return;
+
+      // Try to skip fully-dense blocks at the start. If the entire range is dense,
+      // we can skip the clause entirely (AND with all-1s is a no-op).
+      // Otherwise, fall back to the correct default: intoBitSet + AND + clear.
+      while (doc < upTo) {
+        if (doc == level0LastDocID) {
+          moveToNextLevel0Block();
+        }
+        if (encoding != DeltaEncoding.UNARY) break;
+        long[] blockBits = docBitSet.getBits();
+        if ((blockBits[0] & blockBits[1] & blockBits[2] & blockBits[3]) != -1L) break;
+        // Block is fully dense — skip it.
+        doc = level0LastDocID;
+        docBufferUpto = BLOCK_SIZE;
+      }
+
+      if (doc >= upTo) {
+        // Every block was fully dense — nothing to AND.
+        advance(upTo);
+        return;
+      }
+
+      // Remaining blocks have gaps or use PACKED encoding.
+      // Use the safe default: materialize into scratch, AND, clear.
+      intoBitSet(upTo, scratch, offset);
+      long[] t = bitSet.getBits();
+      long[] s = scratch.getBits();
+      for (int j = 0; j < t.length && j < s.length; j++) {
+        t[j] &= s[j];
+        s[j] = 0;
+      }
+    }
+
+    /**
+     * AND {@code length} bits from {@code src} starting at bit {@code srcFrom} into {@code dst}
+     * starting at bit {@code dstFrom}. Bits in dst outside the range are preserved. Mirrors {@link
+     * #orBitsInline} but uses {@code &=} instead of {@code |=}, with inverted masks for head/tail
+     * to keep bits outside the AND range.
+     */
+    private static void andBitsInline(long[] src, int srcFrom, long[] dst, int dstFrom, int length) {
+      // Align dstFrom to a word boundary
+      if ((dstFrom & 0x3F) != 0) {
+        int dstBit = dstFrom & 0x3F;
+        int srcBit = srcFrom & 0x3F;
+        int head = Math.min(Long.SIZE - dstBit, length);
+        long bits = src[srcFrom >>> 6] >>> srcBit;
+        if (head > Long.SIZE - srcBit) {
+          bits |= src[(srcFrom >>> 6) + 1] << (Long.SIZE - srcBit);
+        }
+        // Keep bits below dstBit, AND the head range, keep bits above
+        long mask = ((1L << head) - 1) << dstBit;
+        dst[dstFrom >>> 6] &= (bits << dstBit) | ~mask;
+        srcFrom += head;
+        dstFrom += head;
+        length -= head;
+      }
+      if (length == 0) return;
+
+      int numWords = length >>> 6;
+      int dstWord = dstFrom >>> 6;
+      int srcWord = srcFrom >>> 6;
+      int srcBit = srcFrom & 0x3F;
+
+      if (srcBit == 0) {
+        for (int i = 0; i < numWords; ++i) {
+          dst[dstWord + i] &= src[srcWord + i];
+        }
+      } else {
+        int invSrcBit = Long.SIZE - srcBit;
+        for (int i = 0; i < numWords; ++i) {
+          dst[dstWord + i] &= (src[srcWord + i] >>> srcBit) | (src[srcWord + i + 1] << invSrcBit);
+        }
+      }
+
+      // Tail bits — AND only the bits in range, keep the rest
+      length &= 0x3F;
+      if (length > 0) {
+        srcFrom += numWords << 6;
+        dstFrom += numWords << 6;
+        int sb = srcFrom & 0x3F;
+        long bits = src[srcFrom >>> 6] >>> sb;
+        if (length > Long.SIZE - sb) {
+          bits |= src[(srcFrom >>> 6) + 1] << (Long.SIZE - sb);
+        }
+        long mask = (1L << length) - 1;
+        dst[dstFrom >>> 6] &= bits | ~mask;
       }
     }
 
