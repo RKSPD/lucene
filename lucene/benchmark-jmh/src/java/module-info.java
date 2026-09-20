@@ -21,6 +21,7 @@
 @SuppressWarnings("requires-automatic")
 module org.apache.lucene.benchmark.jmh {
   requires jmh.core;
+  requires jdk.incubator.vector;
   requires jdk.unsupported;
   requires org.apache.lucene.core;
   requires org.apache.lucene.expressions;

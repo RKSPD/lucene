@@ -129,6 +129,12 @@ public abstract class VectorizationProvider {
    */
   public abstract DocValuesBulkDecodeSupport getDocValuesBulkDecodeSupport();
 
+  /**
+   * Returns operations over block-major materialized filter bit sets. The returned implementation
+   * uses SIMD when available and falls back to scalar operations otherwise.
+   */
+  public abstract BitSetConjunctionSupport getBitSetConjunctionSupport();
+
   // *** Lookup mechanism: ***
 
   private static final Logger LOG = Logger.getLogger(VectorizationProvider.class.getName());
@@ -217,6 +223,8 @@ public abstract class VectorizationProvider {
   private static final Set<String> VALID_CALLERS =
       Set.of(
           "org.apache.lucene.benchmark.jmh.VectorUtilBenchmark",
+          "org.apache.lucene.benchmark.jmh.BlockMajorFilterConjunctionBenchmark",
+          "org.apache.lucene.search.DenseConjunctionBulkScorer",
           "org.apache.lucene.codecs.hnsw.FlatVectorScorerUtil",
           "org.apache.lucene.util.VectorUtil",
           "org.apache.lucene.codecs.lucene104.Lucene104PostingsReader",

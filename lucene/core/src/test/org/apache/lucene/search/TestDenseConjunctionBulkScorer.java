@@ -133,6 +133,56 @@ public class TestDenseConjunctionBulkScorer extends LuceneTestCase {
     assertEquals(acceptDocs.cardinality(), collector.count);
   }
 
+  public void testGroupedFixedBitSetsWithUnalignedRangeAndAcceptDocs() throws IOException {
+    int maxDoc = 100_003;
+    int min = 13;
+    int max = maxDoc - 7;
+    FixedBitSet acceptDocs = new FixedBitSet(maxDoc);
+    for (int doc = 0; doc < maxDoc; ++doc) {
+      if (doc % 3 != 0) {
+        acceptDocs.set(doc);
+      }
+    }
+
+    for (boolean nested : new boolean[] {false, true}) {
+      FixedBitSet[] filters = new FixedBitSet[10];
+      filters[0] = new FixedBitSet(maxDoc);
+      for (int doc = 0; doc < maxDoc; doc += 10) {
+        filters[0].set(doc);
+      }
+      for (int filter = 1; filter < filters.length; ++filter) {
+        filters[filter] = new FixedBitSet(maxDoc);
+        for (int doc = 0; doc < maxDoc; ++doc) {
+          if (random().nextBoolean()) {
+            filters[filter].set(doc);
+          }
+        }
+        if (nested) {
+          filters[filter].or(filters[0]);
+        }
+      }
+
+      FixedBitSet expected = filters[0].clone();
+      for (int filter = 1; filter < filters.length; ++filter) {
+        expected.and(filters[filter]);
+      }
+      expected.and(acceptDocs);
+      expected.clear(0, min);
+      expected.clear(max, maxDoc);
+
+      List<DocIdSetIterator> iterators =
+          Arrays.stream(filters)
+              .map(filter -> new BitSetIterator(filter, filter.cardinality()))
+              .map(DocIdSetIterator.class::cast)
+              .toList();
+      BulkScorer scorer =
+          new DenseConjunctionBulkScorer(iterators, Collections.emptyList(), maxDoc, 0f);
+      FixedBitSet actual = new FixedBitSet(maxDoc);
+      scorer.score(collectInto(actual), acceptDocs, min, max);
+      assertEquals(expected, actual);
+    }
+  }
+
   public void testEmptyIntersection() throws IOException {
     int maxDoc = 100_000;
     FixedBitSet clause1 = new FixedBitSet(maxDoc);

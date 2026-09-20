@@ -60,4 +60,9 @@ final class DefaultVectorizationProvider extends VectorizationProvider {
   public DocValuesBulkDecodeSupport getDocValuesBulkDecodeSupport() {
     return DefaultDocValuesBulkDecodeSupport.INSTANCE;
   }
+
+  @Override
+  public BitSetConjunctionSupport getBitSetConjunctionSupport() {
+    return DefaultBitSetConjunctionSupport.INSTANCE;
+  }
 }

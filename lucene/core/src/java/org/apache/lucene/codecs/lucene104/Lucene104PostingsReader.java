@@ -1015,7 +1015,12 @@ public final class Lucene104PostingsReader extends PostingsReaderBase {
               int sourceTo = Math.min(upTo, level0LastDocID + 1) - docBitSetBase;
 
               if (sourceTo > sourceFrom) {
-                FixedBitSet.orRange(docBitSet, sourceFrom, bitSet, destFrom, sourceTo - sourceFrom);
+                orBitsInline(
+                    docBitSet.getBits(),
+                    sourceFrom,
+                    bitSet.getBits(),
+                    destFrom,
+                    sourceTo - sourceFrom);
               }
               if (docBitSetBase + sourceTo <= level0LastDocID) {
                 // We stopped before the end of the current bit set, which means that we're done.
@@ -1089,10 +1094,114 @@ public final class Lucene104PostingsReader extends PostingsReaderBase {
 
     private void bufferIntoBitSet(int start, int end, FixedBitSet bitSet, int offset)
         throws IOException {
-      // bitSet#set and `doc - offset` get auto-vectorized
-      for (int i = start; i < end; ++i) {
-        int doc = docBuffer[i];
-        bitSet.set(doc - offset);
+      // Interleave four independent read-modify-write streams to overlap store-to-load forwarding
+      // latency and avoid a data-dependent word-change branch.
+      long[] bits = bitSet.getBits();
+      int count = end - start;
+      int quarter = count >>> 2;
+      int start1 = start + quarter;
+      int start2 = start + 2 * quarter;
+      int start3 = start + 3 * quarter;
+      for (int i = 0; i < quarter; ++i) {
+        int position0 = docBuffer[start + i] - offset;
+        int position1 = docBuffer[start1 + i] - offset;
+        int position2 = docBuffer[start2 + i] - offset;
+        int position3 = docBuffer[start3 + i] - offset;
+        bits[position0 >>> 6] |= 1L << position0;
+        bits[position1 >>> 6] |= 1L << position1;
+        bits[position2 >>> 6] |= 1L << position2;
+        bits[position3 >>> 6] |= 1L << position3;
+      }
+      for (int i = start + 4 * quarter; i < end; ++i) {
+        int position = docBuffer[i] - offset;
+        bits[position >>> 6] |= 1L << position;
+      }
+    }
+
+    private static void orBitsInline(
+        long[] source, int sourceFrom, long[] dest, int destFrom, int length) {
+      if ((destFrom & 0x3F) != 0) {
+        int destBit = destFrom & 0x3F;
+        int sourceBit = sourceFrom & 0x3F;
+        int head = Math.min(Long.SIZE - destBit, length);
+        long bits = source[sourceFrom >>> 6] >>> sourceBit;
+        if (head > Long.SIZE - sourceBit) {
+          bits |= source[(sourceFrom >>> 6) + 1] << (Long.SIZE - sourceBit);
+        }
+        dest[destFrom >>> 6] |= (bits & ((1L << head) - 1)) << destBit;
+        sourceFrom += head;
+        destFrom += head;
+        length -= head;
+      }
+      if (length == 0) {
+        return;
+      }
+
+      int numWords = length >>> 6;
+      int destWord = destFrom >>> 6;
+      int sourceWord = sourceFrom >>> 6;
+      int sourceBit = sourceFrom & 0x3F;
+      if (sourceBit == 0) {
+        for (int i = 0; i < numWords; ++i) {
+          dest[destWord + i] |= source[sourceWord + i];
+        }
+      } else {
+        int inverseSourceBit = Long.SIZE - sourceBit;
+        for (int i = 0; i < numWords; ++i) {
+          dest[destWord + i] |=
+              (source[sourceWord + i] >>> sourceBit)
+                  | (source[sourceWord + i + 1] << inverseSourceBit);
+        }
+      }
+
+      length &= 0x3F;
+      if (length > 0) {
+        sourceFrom += numWords << 6;
+        destFrom += numWords << 6;
+        int tailSourceBit = sourceFrom & 0x3F;
+        long bits = source[sourceFrom >>> 6] >>> tailSourceBit;
+        if (length > Long.SIZE - tailSourceBit) {
+          bits |= source[(sourceFrom >>> 6) + 1] << (Long.SIZE - tailSourceBit);
+        }
+        dest[destFrom >>> 6] |= bits & ((1L << length) - 1);
+      }
+    }
+
+    @Override
+    public void andIntoBitSet(int upTo, FixedBitSet bitSet, FixedBitSet scratch, int offset)
+        throws IOException {
+      if (doc >= upTo) {
+        return;
+      }
+
+      // A fully dense UNARY block is an identity operand for AND, so skip it without
+      // materializing into the scratch bit set.
+      while (doc < upTo) {
+        if (doc == level0LastDocID) {
+          moveToNextLevel0Block();
+        }
+        if (encoding != DeltaEncoding.UNARY) {
+          break;
+        }
+        long[] blockBits = docBitSet.getBits();
+        if ((blockBits[0] & blockBits[1] & blockBits[2] & blockBits[3]) != -1L) {
+          break;
+        }
+        doc = level0LastDocID;
+        docBufferUpto = BLOCK_SIZE;
+      }
+
+      if (doc >= upTo) {
+        advance(upTo);
+        return;
+      }
+
+      intoBitSet(upTo, scratch, offset);
+      long[] targetBits = bitSet.getBits();
+      long[] scratchBits = scratch.getBits();
+      for (int i = 0; i < targetBits.length && i < scratchBits.length; ++i) {
+        targetBits[i] &= scratchBits[i];
+        scratchBits[i] = 0;
       }
     }
 

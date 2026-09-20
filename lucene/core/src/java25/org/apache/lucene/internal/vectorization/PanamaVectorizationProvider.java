@@ -103,4 +103,9 @@ final class PanamaVectorizationProvider extends VectorizationProvider {
   public DocValuesBulkDecodeSupport getDocValuesBulkDecodeSupport() {
     return PanamaDocValuesBulkDecodeSupport.INSTANCE;
   }
+
+  @Override
+  public BitSetConjunctionSupport getBitSetConjunctionSupport() {
+    return PanamaBitSetConjunctionSupport.INSTANCE;
+  }
 }

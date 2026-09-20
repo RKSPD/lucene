@@ -210,6 +210,25 @@ public abstract class DocIdSetIterator {
   }
 
   /**
+   * AND this iterator's matches into {@code bitSet}: clear any bits in {@code bitSet} for docs in
+   * [{@link #docID()}, {@code upTo}) that are not matched by this iterator. Upon return, the
+   * iterator is positioned on the first doc ID that is {@code >= upTo}, mirroring {@link
+   * #intoBitSet}.
+   *
+   * <p>The default implementation loads into {@code scratch} via {@link #intoBitSet} and then
+   * intersects it. Implementations that know their block-level density may override this method to
+   * skip fully dense blocks.
+   *
+   * @lucene.internal
+   */
+  public void andIntoBitSet(int upTo, FixedBitSet bitSet, FixedBitSet scratch, int offset)
+      throws IOException {
+    intoBitSet(upTo, scratch, offset);
+    bitSet.and(scratch);
+    scratch.clear();
+  }
+
+  /**
    * Copy doc IDs of this iterator into the given array, starting at the current {@link #docID()}
    * and stopping before {@code upTo}, and return the number of copied doc IDs. At most {@code
    * docs.length} doc IDs are copied, so callers must call this method repeatedly in order to

@@ -90,4 +90,9 @@ final class NativeVectorizationProvider extends VectorizationProvider {
   public DocValuesBulkDecodeSupport getDocValuesBulkDecodeSupport() {
     return delegateVectorUtilProvider.getDocValuesBulkDecodeSupport();
   }
+
+  @Override
+  public BitSetConjunctionSupport getBitSetConjunctionSupport() {
+    return delegateVectorUtilProvider.getBitSetConjunctionSupport();
+  }
 }
