@@ -27,6 +27,7 @@ import jdk.incubator.vector.LongVector;
 import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorSpecies;
 import org.apache.lucene.util.BitUtil;
+import org.apache.lucene.util.VectorUtil;
 
 /**
  * Scalar kernels with transparent SIMD replacements for coarse scans, packing, and INT8 reranking.
@@ -124,6 +125,8 @@ class Kernels {
     private static final VectorSpecies<Byte> DOT_BYTES = ByteVector.SPECIES_64;
     private static final VectorSpecies<Integer> DOT_INTS = IntVector.SPECIES_256;
     private static final VectorSpecies<Float> FLOATS = FloatVector.SPECIES_PREFERRED;
+    private static final boolean DOT_IS_256 =
+        IntVector.SPECIES_PREFERRED.vectorBitSize() == DOT_INTS.vectorBitSize();
 
     /** Uses SIMD for fixed-width native-memory Hamming batches. */
     @Override
@@ -133,8 +136,30 @@ class Kernels {
           hamming8Native(q, codes, offset, rows, out);
           return;
         }
+        if (q.length == BYTES.length() * 4) {
+          hamming4Native(q, codes, offset, rows, out);
+          return;
+        }
       }
       super.hamming(q, codes, offset, rows, out);
+    }
+
+    /** Four-vector coarse scan, the 1024-dimension Nitrox2 shape on AVX-512. */
+    private static void hamming4Native(
+        byte[] q, MemorySegment codes, long offset, int rows, int[] out) {
+      int step = BYTES.length(), len = 4 * step;
+      var q0 = query(q, 0);
+      var q1 = query(q, step);
+      var q2 = query(q, 2 * step);
+      var q3 = query(q, 3 * step);
+      for (int r = 0; r < rows; r++) {
+        long at = offset + (long) r * len;
+        var s0 = popcount(q0, code(codes, at));
+        var s1 = popcount(q1, code(codes, at + step));
+        var s2 = popcount(q2, code(codes, at + 2L * step));
+        var s3 = popcount(q3, code(codes, at + 3L * step));
+        out[r] = (int) s0.add(s1).add(s2.add(s3)).reduceLanes(VectorOperators.ADD);
+      }
     }
 
     /** Keeps the production scan small enough for C2 to retain all query vectors in registers. */
@@ -171,6 +196,22 @@ class Kernels {
     /** Uses SIMD for fixed-width byte-array Hamming batches. */
     @Override
     void hamming(byte[] q, byte[] codes, int offset, int rows, int[] out) {
+      if (q.length == BYTES.length() * 4) {
+        int step = BYTES.length(), len = 4 * step;
+        var q0 = query(q, 0);
+        var q1 = query(q, step);
+        var q2 = query(q, 2 * step);
+        var q3 = query(q, 3 * step);
+        for (int r = 0; r < rows; r++) {
+          int at = offset + r * len;
+          var s0 = popcount(q0, code(codes, at));
+          var s1 = popcount(q1, code(codes, at + step));
+          var s2 = popcount(q2, code(codes, at + 2 * step));
+          var s3 = popcount(q3, code(codes, at + 3 * step));
+          out[r] = (int) s0.add(s1).add(s2.add(s3)).reduceLanes(VectorOperators.ADD);
+        }
+        return;
+      }
       if (q.length == BYTES.length() * 8) {
         var q0 = query(q, 0);
         var q1 = query(q, BYTES.length());
@@ -274,6 +315,14 @@ class Kernels {
     /** Uses SIMD to score four signed-byte records at a time. */
     @Override
     void dotProducts(byte[] query, byte[] records, int stride, int count, int[] out) {
+      if (DOT_IS_256 == false) {
+        byte[] scratch = new byte[query.length];
+        for (int r = 0; r < count; r++) {
+          System.arraycopy(records, r * stride, scratch, 0, query.length);
+          out[r] = VectorUtil.dotProduct(query, scratch);
+        }
+        return;
+      }
       int r = 0;
       for (; r + 4 <= count; r += 4) {
         int o0 = r * stride, o1 = o0 + stride, o2 = o1 + stride, o3 = o2 + stride;
