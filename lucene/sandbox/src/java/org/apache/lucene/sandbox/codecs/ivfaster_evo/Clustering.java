@@ -202,10 +202,10 @@ final class Clustering {
                 cell2[i] = warm.cell2[i];
                 if (Float.isNaN(warm.d1[i])) {
                   d1[i] = codes.exactDistance(vector, carried);
-                  d2[i] =
-                      cell2[i] >= 0 && cell2[i] < nlist
-                          ? codes.exactDistance(vector, cell2[i])
-                          : Float.MAX_VALUE;
+                  // The seed centroids may combine several source segments, so a carried
+                  // runner-up is stale. Treat it as adjacent to force a safe first reap.
+                  d2[i] = d1[i];
+                  cell2[i] = -1;
                 } else {
                   d1[i] = warm.d1[i];
                   d2[i] = warm.d2[i];

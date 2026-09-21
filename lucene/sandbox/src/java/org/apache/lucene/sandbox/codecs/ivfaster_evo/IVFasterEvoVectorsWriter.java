@@ -193,6 +193,7 @@ final class IVFasterEvoVectorsWriter extends KnnVectorsWriter {
     HotStart.Seed donorSnapshot = donor < 0 ? null : snapshots[donor];
     int[] cells = new int[0], cell2 = new int[0];
     float[] d1 = new float[0], d2 = new float[0];
+    int[][] seedMembers = new int[readers][];
     try (var staged = new StagedVectors(state, new FineCodec(format.fineTier, dim), readers)) {
       int max = StagedVectors.CHUNK_ORDS;
       int[] srcs = new int[max], ords = new int[max], docs = new int[max];
@@ -223,25 +224,40 @@ final class IVFasterEvoVectorsWriter extends KnnVectorsWriter {
         for (int j = 0; j < n; j++) {
           int r = srcs[j], ord = ords[j];
           HotStart.Seed snapshot = snapshots[r];
-          if (snapshot != null
-              && snapshot.assignment() != null
-              && donorSnapshot != null
-              && snapshot.lineage().equals(donorSnapshot.lineage())
-              && snapshot.assignment().length == views[r].count
-              && ord < snapshot.assignment().length) {
-            cells[at] = snapshot.assignment()[ord];
-            cell2[at] = snapshot.cell2()[ord];
-            d1[at] = r == donor ? snapshot.d1()[ord] : Float.NaN;
-            d2[at] = r == donor ? snapshot.d2()[ord] : Float.NaN;
+          boolean sameLineage =
+              snapshot != null
+                  && donorSnapshot != null
+                  && snapshot.lineage().equals(donorSnapshot.lineage())
+                  && views[r].nlist == from.nlist;
+          if (sameLineage) {
+            int cell =
+                snapshot.assignment() != null
+                        && snapshot.assignment().length == views[r].count
+                        && ord < snapshot.assignment().length
+                    ? snapshot.assignment()[ord]
+                    : views[r].cellOf(ord);
+            cells[at] = cell;
+            cell2[at] =
+                snapshot.cell2() != null && ord < snapshot.cell2().length
+                    ? snapshot.cell2()[ord]
+                    : -1;
+            d1[at] = d2[at] = Float.NaN;
+            if (seedMembers[r] == null) seedMembers[r] = new int[from.nlist];
+            seedMembers[r][cell]++;
           } else {
             cells[at] = r == donor ? from.cellOf(ord) : -1;
             cell2[at] = -1;
-            d1[at] = d2[at] = Float.MAX_VALUE;
+            d1[at] = d2[at] = r == donor ? Float.NaN : Float.MAX_VALUE;
+            if (r == donor) {
+              if (seedMembers[r] == null) seedMembers[r] = new int[from.nlist];
+              seedMembers[r][cells[at]]++;
+            }
           }
           at++;
         }
       }
-      float[][] seed = from == null ? null : from.centroids;
+      float[][] seed =
+          from == null ? null : weightedSeed(views, snapshots, seedMembers, donor, dim);
       WarmState warm =
           seed == null
               ? null
@@ -258,6 +274,51 @@ final class IVFasterEvoVectorsWriter extends KnnVectorsWriter {
           donorSnapshot == null ? state.segmentInfo.name : donorSnapshot.lineage());
     }
     return null;
+  }
+
+  /** Averages corresponding same-lineage centroids by their live primary-cell populations. */
+  private static float[][] weightedSeed(
+      Field[] views,
+      HotStart.Seed[] snapshots,
+      int[][] members,
+      int donor,
+      int dim) {
+    Field from = views[donor];
+    HotStart.Seed donorSnapshot = snapshots[donor];
+    float[][] seed = new float[from.nlist][dim];
+    long[] weights = new long[from.nlist];
+    for (int r = 0; r < views.length; r++) {
+      if (views[r] == null || members[r] == null || views[r].nlist != from.nlist) continue;
+      HotStart.Seed snapshot = snapshots[r];
+      if (r != donor
+          && (snapshot == null
+              || donorSnapshot == null
+              || snapshot.lineage().equals(donorSnapshot.lineage()) == false)) continue;
+      for (int c = 0; c < from.nlist; c++) {
+        int weight = members[r][c];
+        if (weight == 0) continue;
+        weights[c] += weight;
+        float[] source = views[r].centroids[c], target = seed[c];
+        for (int d = 0; d < dim; d++) target[d] += weight * source[d];
+      }
+    }
+    for (int c = 0; c < from.nlist; c++) {
+      if (weights[c] == 0) {
+        System.arraycopy(from.centroids[c], 0, seed[c], 0, dim);
+      } else {
+        normalize(seed[c]);
+      }
+    }
+    return seed;
+  }
+
+  /** Normalizes one centroid in place. */
+  private static void normalize(float[] vector) {
+    double norm = 0;
+    for (float value : vector) norm += (double) value * value;
+    if (norm == 0) return;
+    float scale = (float) (1.0 / Math.sqrt(norm));
+    for (int d = 0; d < vector.length; d++) vector[d] *= scale;
   }
 
   /** Clusters staged rows and writes all field sections. */
