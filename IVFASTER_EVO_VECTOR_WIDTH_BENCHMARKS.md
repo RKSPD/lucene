@@ -51,6 +51,26 @@ The 10M and 39.77M indexes were built with 8 indexing threads, 24 merge workers,
 | 39.77M | IVFasterEvo | 2,054.73 s | 16.19 s | 1,227.50 s | 3,298.42 s |
 | 39.77M | IVFaster | 2,244.08 s | 0.00 s | 1,291.74 s | 3,535.82 s |
 
+## HNSW SQ7 baseline
+
+This box also has a 1M-vector Lucene HNSW SQ7 run from August 12, 2026.
+Luceneutil reports the quantized representation as `8 bits` because each SQ7
+value occupies one byte. The index used `maxConn=16`, `beamWidthIndex=100`,
+`topK=100`, and 1,000 queries.
+
+| Vectors | Fanout | Recall | Latency |
+|---:|---:|---:|---:|
+| 1M | 100 | 0.933 | 1.426 ms |
+| 1M | 150 | 0.946 | 1.703 ms |
+| 1M | 200 | 0.954 | 1.987 ms |
+
+The SQ7 HNSW index took 131.40 s to ingest, 95.89 s waiting for merges, and
+555.44 s to force merge, for 782.73 s total. Its final index size was
+4,957.28 MB.
+
+Only the 1M SQ7 HNSW scale was available in the benchmark logs on this box; no
+comparable 10M or 39.77M SQ7 HNSW run was recorded.
+
 ## Implementation change
 
 The INT8 rerank kernel remains specialized for the tuned 256-bit shape. At
@@ -60,4 +80,3 @@ product, allowing core to select its native-width implementation.
 
 The coarse Hamming scan also includes IVFaster's four-vector shape for a
 256-byte Nitrox2 row under 512-bit species.
-
