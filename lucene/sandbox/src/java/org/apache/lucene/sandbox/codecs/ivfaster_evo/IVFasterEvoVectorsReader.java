@@ -73,6 +73,13 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
   private static final int VERIFY_MIN = 64, VERIFY_MULTIPLIER = 2;
   private static final int DEDUP_MASK = (Integer.highestOneBit(SHORTLIST) << 2) - 1;
   private static final Kernels K = Kernels.INSTANCE;
+  private static final boolean REPORT_ENGAGEMENT = Boolean.getBoolean("ivfaster.reportEngagement");
+  private static final java.util.concurrent.atomic.AtomicLong SCAN_QUERIES =
+      new java.util.concurrent.atomic.AtomicLong();
+  private static final java.util.concurrent.atomic.AtomicLong SCANNED_SLOTS =
+      new java.util.concurrent.atomic.AtomicLong();
+  private static final java.util.concurrent.atomic.AtomicLong PROBED_CELLS =
+      new java.util.concurrent.atomic.AtomicLong();
 
   private final Map<String, Field> fields = new HashMap<>();
   private final IndexInput data;
@@ -123,7 +130,8 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
     final FineCodec fine;
 
     RandomAccessInput records, coarse;
-    MemorySegment mapped;
+    MemorySegmentAccessInput coarseAccess;
+    MemorySegment coarseSeg;
     int[] cellStart, ordToSlot, ordToDoc, slotDoc, allCells, primaryCells;
     float[][] centroids;
     private volatile CentroidCodes codes;
@@ -159,8 +167,9 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
     synchronized Field open() throws IOException {
       if (records != null) return this;
       coarse = section(2);
-      if (coarse instanceof MemorySegmentAccessInput in && coarse.length() > 0) {
-        mapped = in.segmentSliceOrNull(0, coarse.length());
+      if (coarse instanceof MemorySegmentAccessInput in) {
+        coarseAccess = in;
+        coarseSeg = segmentOrNull(in, 0, coarse.length());
       }
       cellStart = new int[nlist + 1];
       if (nlist > 0) {
@@ -184,6 +193,24 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
       for (float[] centroid : centroids) all.readFloats(centroid, 0, dim);
       records = recs;
       return this;
+    }
+
+    /** Returns a mapped slice when one mmap chunk covers the requested range. */
+    private MemorySegment segmentOrNull(MemorySegmentAccessInput in, long offset, long length) {
+      if (length == 0) return null;
+      try {
+        return in.segmentSliceOrNull(offset, length);
+      } catch (IOException _) {
+        return null;
+      }
+    }
+
+    /** Returns a mapping rebased to one cell run when the whole coarse section is not mappable. */
+    private MemorySegment coarseRun(int slotBase, int rows) {
+      return coarseAccess == null
+          ? null
+          : segmentOrNull(
+              coarseAccess, (long) slotBase * coarseBytes, (long) rows * coarseBytes);
     }
 
     /** Lazily builds centroid codes and loads the navigation graph. */
@@ -342,17 +369,30 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
       /** Scans selected cells and admits the best coarse candidates. */
       private void scan(int[] cells, Bits liveDocs) throws IOException {
         int total = prefetch(cells, cells.length);
+        if (REPORT_ENGAGEMENT) {
+          SCAN_QUERIES.incrementAndGet();
+          SCANNED_SLOTS.addAndGet(total);
+          PROBED_CELLS.addAndGet(cells.length);
+        }
         long[] packed = scratch.packed = ArrayUtil.growNoCopy(scratch.packed, total);
         for (int cell : cells) {
           int base = cellStart[cell], rows = cellStart[cell + 1] - base;
           int[] distances = scratch.distances = ArrayUtil.growNoCopy(scratch.distances, rows);
           long at = (long) base * coarseBytes;
-          if (mapped != null) {
-            K.hamming(qCode, mapped, at, rows, distances);
+          if (coarseSeg != null) {
+            K.hamming(qCode, coarseSeg, at, rows, distances);
           } else {
-            scratch.bytes = ArrayUtil.growNoCopy(scratch.bytes, rows * coarseBytes);
-            coarse.readBytes(at, scratch.bytes, 0, rows * coarseBytes);
-            K.hamming(qCode, scratch.bytes, 0, rows, distances);
+            MemorySegment run = coarseRun(base, rows);
+            if (run != null) {
+              K.hamming(qCode, run, 0, rows, distances);
+            } else {
+              scratch.bytes = ArrayUtil.growNoCopy(scratch.bytes, coarseBytes);
+              for (int row = 0; row < rows; row++) {
+                coarse.readBytes(
+                    at + (long) row * coarseBytes, scratch.bytes, 0, coarseBytes);
+                distances[row] = K.hamming(qCode, scratch.bytes, 0);
+              }
+            }
           }
           for (int from = 0; from < rows; from += ADMIT_BLOCK) {
             int block = Math.min(ADMIT_BLOCK, rows - from);
@@ -434,13 +474,15 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
           done += n;
           scratch.packed = ArrayUtil.grow(scratch.packed, size + prefetch(batch, n));
           for (int c = 0; c < n; c++) {
-            int end = cellStart[batch[c] + 1];
-            for (int slot = cellStart[batch[c]]; slot < end; slot++) {
+            int base = cellStart[batch[c]], end = cellStart[batch[c] + 1];
+            MemorySegment run = coarseSeg == null ? coarseRun(base, end - base) : coarseSeg;
+            long runBase = coarseSeg == null ? 0 : (long) base * coarseBytes;
+            for (int slot = base; slot < end; slot++) {
               int doc = slotDoc[slot];
               if (filter.get(doc) == false) continue;
-              long at = (long) slot * coarseBytes;
-              if (mapped == null) coarse.readBytes(at, code, 0, coarseBytes);
-              int d = mapped == null ? K.hamming(qCode, code, 0) : K.hamming(qCode, mapped, at);
+              long at = runBase + (long) (slot - base) * coarseBytes;
+              if (run == null) coarse.readBytes((long) slot * coarseBytes, code, 0, coarseBytes);
+              int d = run == null ? K.hamming(qCode, code, 0) : K.hamming(qCode, run, at);
               survivors++;
               if (distinct < SHORTLIST && scratch.addDistinct(doc)) distinct++;
               if (d > threshold) continue;
@@ -614,9 +656,19 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
     CodecUtil.checksumEntireFile(data);
   }
 
-  /** Closes the segment data input. */
+  /** Closes the segment data input and optionally reports scan engagement. */
   @Override
   public void close() throws IOException {
+    if (REPORT_ENGAGEMENT) {
+      long queries = Math.max(1, SCAN_QUERIES.get());
+      System.out.println(
+          "[ivfaster-evo] queries="
+              + SCAN_QUERIES.get()
+              + " slotsScanned/query="
+              + SCANNED_SLOTS.get() / queries
+              + " cellsProbed/query="
+              + PROBED_CELLS.get() / queries);
+    }
     data.close();
   }
 }

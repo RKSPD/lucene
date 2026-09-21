@@ -67,7 +67,16 @@ class Kernels {
 
   /** Computes one Hamming distance from a byte array. */
   int hamming(byte[] q, byte[] codes, int offset) {
-    return tail(q, MemorySegment.ofArray(codes), offset, 0);
+    return scalarHamming(q, codes, offset);
+  }
+
+  /** Computes Hamming distance directly from heap arrays without foreign-memory wrappers. */
+  private static int scalarHamming(byte[] q, byte[] codes, int offset) {
+    int sum = 0;
+    for (int i = 0; i < q.length; i++) {
+      sum += Integer.bitCount((q[i] ^ codes[offset + i]) & 255);
+    }
+    return sum;
   }
 
   /** Finishes a Hamming distance with scalar XOR and popcount. */
@@ -119,35 +128,44 @@ class Kernels {
     /** Uses SIMD for fixed-width native-memory Hamming batches. */
     @Override
     void hamming(byte[] q, MemorySegment codes, long offset, int rows, int[] out) {
-      if (codes.isNative() && q.length == BYTES.length() * 8) {
-        var q0 = query(q, 0);
-        var q1 = query(q, BYTES.length());
-        var q2 = query(q, 2 * BYTES.length());
-        var q3 = query(q, 3 * BYTES.length());
-        var q4 = query(q, 4 * BYTES.length());
-        var q5 = query(q, 5 * BYTES.length());
-        var q6 = query(q, 6 * BYTES.length());
-        var q7 = query(q, 7 * BYTES.length());
-        for (int r = 0; r < rows; r++) {
-          long at = offset + (long) r * q.length;
-          var s0 = popcount(q0, code(codes, at));
-          var s1 = popcount(q1, code(codes, at + BYTES.length()));
-          var s2 = popcount(q2, code(codes, at + 2L * BYTES.length()));
-          var s3 = popcount(q3, code(codes, at + 3L * BYTES.length()));
-          var s4 = popcount(q4, code(codes, at + 4L * BYTES.length()));
-          var s5 = popcount(q5, code(codes, at + 5L * BYTES.length()));
-          var s6 = popcount(q6, code(codes, at + 6L * BYTES.length()));
-          var s7 = popcount(q7, code(codes, at + 7L * BYTES.length()));
-          out[r] =
-              (int)
-                  s0.add(s1)
-                      .add(s2.add(s3))
-                      .add(s4.add(s5).add(s6.add(s7)))
-                      .reduceLanes(VectorOperators.ADD);
+      if (codes.isNative()) {
+        if (q.length == BYTES.length() * 8) {
+          hamming8Native(q, codes, offset, rows, out);
+          return;
         }
-        return;
       }
       super.hamming(q, codes, offset, rows, out);
+    }
+
+    /** Keeps the production scan small enough for C2 to retain all query vectors in registers. */
+    private static void hamming8Native(
+        byte[] q, MemorySegment codes, long offset, int rows, int[] out) {
+      int step = BYTES.length(), len = 8 * step;
+      var q0 = query(q, 0);
+      var q1 = query(q, step);
+      var q2 = query(q, 2 * step);
+      var q3 = query(q, 3 * step);
+      var q4 = query(q, 4 * step);
+      var q5 = query(q, 5 * step);
+      var q6 = query(q, 6 * step);
+      var q7 = query(q, 7 * step);
+      for (int r = 0; r < rows; r++) {
+        long at = offset + (long) r * len;
+        var s0 = popcount(q0, code(codes, at));
+        var s1 = popcount(q1, code(codes, at + step));
+        var s2 = popcount(q2, code(codes, at + 2L * step));
+        var s3 = popcount(q3, code(codes, at + 3L * step));
+        var s4 = popcount(q4, code(codes, at + 4L * step));
+        var s5 = popcount(q5, code(codes, at + 5L * step));
+        var s6 = popcount(q6, code(codes, at + 6L * step));
+        var s7 = popcount(q7, code(codes, at + 7L * step));
+        out[r] =
+            (int)
+                s0.add(s1)
+                    .add(s2.add(s3))
+                    .add(s4.add(s5).add(s6.add(s7)))
+                    .reduceLanes(VectorOperators.ADD);
+      }
     }
 
     /** Uses SIMD for fixed-width byte-array Hamming batches. */

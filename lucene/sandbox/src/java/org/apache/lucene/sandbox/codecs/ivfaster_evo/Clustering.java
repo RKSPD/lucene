@@ -46,7 +46,10 @@ final class Clustering {
 
   static final float SOAR_LAMBDA = 1f;
 
-  static final float CONVERGE_FRACTION = 0.003f;
+  static final float CONVERGE_FRACTION =
+      Float.parseFloat(System.getProperty("ivfaster.convergeFraction", "0.005"));
+
+  static final int MAX_ITERS = Integer.getInteger("ivfaster.lloydIters", 10);
 
   static final long FIX = 1L << 30;
 
@@ -84,9 +87,11 @@ final class Clustering {
     Run run = new Run(src, nlist, seed, spillBits);
     run.routeAll(warm);
     int count = src.count, convergeAt = (int) (CONVERGE_FRACTION * count);
+    int iterations = 0;
     do {
       run.updateCentroids();
-    } while (run.reap(false) > convergeAt);
+      iterations++;
+    } while (run.reap(false) > convergeAt && iterations < MAX_ITERS);
     run.reap(true);
     for (int i = 0; i < count; i++) {
       if (run.cells[i * run.stride] < 0) run.cells[i * run.stride] = run.assignment[i];

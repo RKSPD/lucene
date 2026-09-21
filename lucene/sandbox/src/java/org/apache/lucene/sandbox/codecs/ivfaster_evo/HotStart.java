@@ -41,7 +41,6 @@ import org.apache.lucene.store.Directory;
  * discarded and reduces repeated indexing cost.
  */
 final class HotStart {
-  private static final int KEPT = 4;
   private static final Map<Directory, Map<String, List<Seed>>> INDEXES = new WeakHashMap<>();
 
   /** Reusable clustering state associated with one segment lineage. */
@@ -87,7 +86,6 @@ final class HotStart {
             result.d1(),
             result.d2()));
     seeds.sort(Comparator.comparingInt(Seed::vectors).reversed());
-    if (seeds.size() > KEPT) seeds.subList(KEPT, seeds.size()).clear();
   }
 
   /** Returns the cached state for a specific segment. */
