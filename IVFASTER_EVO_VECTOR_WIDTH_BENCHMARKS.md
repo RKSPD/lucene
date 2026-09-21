@@ -9,6 +9,8 @@ Benchmarked on September 21, 2026 using the Cohere Wikipedia corpus with
 - `nlist=sqrt(vector count)`: 1,000 / 3,162 / 6,306
 - `spill=1`, `spillMargin=1.05`
 - `nprobe=32`, `nprobeMargin=0.75`
+- The refreshed 1M 256-bit Evo result uses `nprobe=45` to match IVFaster's
+  `0.949` recall
 - `bruteN=700`, `verifyMultiplier=2`
 - Nitrox2 coarse tier and INT8 fine tier
 - One force-merged segment
@@ -21,7 +23,7 @@ Latency is milliseconds per query. Each cell is `recall / latency`.
 
 | Vectors | IVFasterEvo 128-bit | IVFaster 128-bit | IVFasterEvo 256-bit | IVFaster 256-bit |
 |---:|---:|---:|---:|---:|
-| 1M | 0.940 / **1.125 ms** | 0.949 / 1.790 ms | 0.940 / **0.761 ms** | 0.949 / 0.888 ms |
+| 1M | 0.940 / **1.125 ms** | 0.949 / 1.790 ms | 0.949 / **0.874 ms** | 0.949 / 0.888 ms |
 | 10M | 0.947 / **3.061 ms** | 0.948 / 4.771 ms | 0.947 / **1.997 ms** | 0.948 / 2.221 ms |
 | 39.77M | 0.942 / **6.001 ms** | 0.939 / 8.953 ms | 0.942 / **4.082 ms** | 0.939 / 4.251 ms |
 
@@ -29,7 +31,7 @@ Latency is milliseconds per query. Each cell is `recall / latency`.
 
 | Vectors | Evo versus IVFaster, 128-bit | Evo versus IVFaster, 256-bit | Evo 128-bit slowdown versus 256-bit |
 |---:|---:|---:|---:|
-| 1M | 37.2% faster | 14.3% faster | 1.48x |
+| 1M | 37.2% faster | 1.6% faster | N/A (different `nprobe`) |
 | 10M | 35.8% faster | 10.1% faster | 1.53x |
 | 39.77M | 33.0% faster | 4.0% faster | 1.47x |
 
@@ -44,7 +46,7 @@ The 10M and 39.77M indexes were built with 8 indexing threads, 24 merge workers,
 
 | Vectors | Codec | Ingest | Merge wait | Force merge | Total |
 |---:|---|---:|---:|---:|---:|
-| 1M | IVFasterEvo | 18.12 s | 5.91 s | 14.17 s | 38.20 s |
+| 1M | IVFasterEvo | 20.94 s | 0.00 s | 15.01 s | 35.95 s |
 | 1M | IVFaster | 18.70 s | 0.00 s | 15.05 s | 33.75 s |
 | 10M | IVFasterEvo | 231.76 s | 27.80 s | 169.53 s | 429.09 s |
 | 10M | IVFaster | 250.20 s | 0.00 s | 188.72 s | 438.92 s |
