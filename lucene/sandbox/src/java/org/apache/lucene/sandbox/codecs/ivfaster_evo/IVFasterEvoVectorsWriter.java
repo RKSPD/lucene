@@ -256,8 +256,7 @@ final class IVFasterEvoVectorsWriter extends KnnVectorsWriter {
           at++;
         }
       }
-      float[][] seed =
-          from == null ? null : weightedSeed(views, snapshots, seedMembers, donor, dim);
+      float[][] seed = from == null ? null : weightedSeed(views, snapshots, seedMembers, donor);
       WarmState warm =
           seed == null
               ? null
@@ -281,44 +280,19 @@ final class IVFasterEvoVectorsWriter extends KnnVectorsWriter {
       Field[] views,
       HotStart.Seed[] snapshots,
       int[][] members,
-      int donor,
-      int dim) {
-    Field from = views[donor];
+      int donor) {
+    float[][][] centroids = new float[views.length][][];
+    String[] lineages = new String[views.length];
     HotStart.Seed donorSnapshot = snapshots[donor];
-    float[][] seed = new float[from.nlist][dim];
-    long[] weights = new long[from.nlist];
     for (int r = 0; r < views.length; r++) {
-      if (views[r] == null || members[r] == null || views[r].nlist != from.nlist) continue;
       HotStart.Seed snapshot = snapshots[r];
-      if (r != donor
-          && (snapshot == null
-              || donorSnapshot == null
-              || snapshot.lineage().equals(donorSnapshot.lineage()) == false)) continue;
-      for (int c = 0; c < from.nlist; c++) {
-        int weight = members[r][c];
-        if (weight == 0) continue;
-        weights[c] += weight;
-        float[] source = views[r].centroids[c], target = seed[c];
-        for (int d = 0; d < dim; d++) target[d] += weight * source[d];
-      }
+      if (views[r] != null) centroids[r] = views[r].centroids;
+      if (snapshot != null) lineages[r] = snapshot.lineage();
     }
-    for (int c = 0; c < from.nlist; c++) {
-      if (weights[c] == 0) {
-        System.arraycopy(from.centroids[c], 0, seed[c], 0, dim);
-      } else {
-        normalize(seed[c]);
-      }
+    if (lineages[donor] == null) {
+      lineages[donor] = donorSnapshot == null ? "" : donorSnapshot.lineage();
     }
-    return seed;
-  }
-
-  /** Normalizes one centroid in place. */
-  private static void normalize(float[] vector) {
-    double norm = 0;
-    for (float value : vector) norm += (double) value * value;
-    if (norm == 0) return;
-    float scale = (float) (1.0 / Math.sqrt(norm));
-    for (int d = 0; d < vector.length; d++) vector[d] *= scale;
+    return HotStart.weightedCentroids(centroids, members, lineages, donor);
   }
 
   /** Clusters staged rows and writes all field sections. */

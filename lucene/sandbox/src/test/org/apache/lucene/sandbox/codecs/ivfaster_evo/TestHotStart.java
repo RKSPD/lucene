@@ -153,6 +153,20 @@ public class TestHotStart extends LuceneTestCase {
     }
   }
 
+  public void testWeightedCentroidsUseSameLineageAndPopulation() {
+    float[][][] centroids = {
+      {{1, 0}, {0, 1}},
+      {{0, 1}, {1, 0}},
+      {{-1, 0}, {0, -1}}
+    };
+    int[][] members = {{3, 1}, {1, 3}, {100, 100}};
+    String[] lineages = {"a", "a", "b"};
+    float[][] seed = HotStart.weightedCentroids(centroids, members, lineages, 0);
+    float scale = (float) (1.0 / Math.sqrt(10));
+    assertArrayEquals(new float[] {3 * scale, scale}, seed[0], 0f);
+    assertArrayEquals(new float[] {3 * scale, scale}, seed[1], 0f);
+  }
+
   public void testBulkScorerQueryMatchesStockQuery() throws Exception {
     try (Directory dir = newDirectory();
         IndexWriter writer =
