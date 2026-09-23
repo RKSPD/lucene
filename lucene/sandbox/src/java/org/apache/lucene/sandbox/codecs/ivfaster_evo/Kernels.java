@@ -128,7 +128,7 @@ class Kernels {
     private static final boolean DOT_IS_256 =
         IntVector.SPECIES_PREFERRED.vectorBitSize() == DOT_INTS.vectorBitSize();
 
-    /** Uses SIMD for fixed-width native-memory Hamming batches. */
+    /** Uses a fixed-register-pressure SIMD loop for native-memory Hamming batches. */
     @Override
     void hamming(byte[] q, MemorySegment codes, long offset, int rows, int[] out) {
       if (codes.isNative()) {
@@ -141,10 +141,14 @@ class Kernels {
           return;
         }
       }
+      if (codes.isNative() && (q.length & 31) == 0) {
+        hammingRows(q, codes, offset, rows, out);
+        return;
+      }
       super.hamming(q, codes, offset, rows, out);
     }
 
-    /** Four-vector coarse scan, the 1024-dimension Nitrox2 shape on AVX-512. */
+    /** Four-register scan for a code that exactly fills four preferred vectors. */
     private static void hamming4Native(
         byte[] q, MemorySegment codes, long offset, int rows, int[] out) {
       int step = BYTES.length(), len = 4 * step;
@@ -162,7 +166,7 @@ class Kernels {
       }
     }
 
-    /** Keeps the production scan small enough for C2 to retain all query vectors in registers. */
+    /** Eight-register scan for a code that exactly fills eight preferred vectors. */
     private static void hamming8Native(
         byte[] q, MemorySegment codes, long offset, int rows, int[] out) {
       int step = BYTES.length(), len = 8 * step;
@@ -193,51 +197,90 @@ class Kernels {
       }
     }
 
-    /** Uses SIMD for fixed-width byte-array Hamming batches. */
+    /**
+     * Scores four rows together so each query chunk is loaded once without retaining an entire
+     * dimension-specific query in registers.
+     */
+    private static void hammingRows(
+        byte[] q, MemorySegment codes, long offset, int rows, int[] out) {
+      int r = 0;
+      for (; r + 4 <= rows; r += 4) {
+        long row0 = offset + (long) r * q.length;
+        long row1 = row0 + q.length, row2 = row1 + q.length, row3 = row2 + q.length;
+        var sum0 = LongVector.zero(LONGS);
+        var sum1 = LongVector.zero(LONGS);
+        var sum2 = LongVector.zero(LONGS);
+        var sum3 = LongVector.zero(LONGS);
+        int i = 0;
+        for (; i <= q.length - BYTES.length(); i += BYTES.length()) {
+          var query = query(q, i);
+          sum0 = sum0.add(popcount(query, code(codes, row0 + i)));
+          sum1 = sum1.add(popcount(query, code(codes, row1 + i)));
+          sum2 = sum2.add(popcount(query, code(codes, row2 + i)));
+          sum3 = sum3.add(popcount(query, code(codes, row3 + i)));
+        }
+        int score0 = (int) sum0.reduceLanes(VectorOperators.ADD);
+        int score1 = (int) sum1.reduceLanes(VectorOperators.ADD);
+        int score2 = (int) sum2.reduceLanes(VectorOperators.ADD);
+        int score3 = (int) sum3.reduceLanes(VectorOperators.ADD);
+        for (; i < q.length; i++) {
+          int query = q[i];
+          score0 += Integer.bitCount((query ^ codes.get(ValueLayout.JAVA_BYTE, row0 + i)) & 255);
+          score1 += Integer.bitCount((query ^ codes.get(ValueLayout.JAVA_BYTE, row1 + i)) & 255);
+          score2 += Integer.bitCount((query ^ codes.get(ValueLayout.JAVA_BYTE, row2 + i)) & 255);
+          score3 += Integer.bitCount((query ^ codes.get(ValueLayout.JAVA_BYTE, row3 + i)) & 255);
+        }
+        out[r] = score0;
+        out[r + 1] = score1;
+        out[r + 2] = score2;
+        out[r + 3] = score3;
+      }
+      for (; r < rows; r++) out[r] = INSTANCE.hamming(q, codes, offset + (long) r * q.length);
+    }
+
+    /** Uses a fixed-register-pressure SIMD loop for byte-array Hamming batches. */
     @Override
     void hamming(byte[] q, byte[] codes, int offset, int rows, int[] out) {
-      if (q.length == BYTES.length() * 4) {
-        int step = BYTES.length(), len = 4 * step;
-        var q0 = query(q, 0);
-        var q1 = query(q, step);
-        var q2 = query(q, 2 * step);
-        var q3 = query(q, 3 * step);
+      if (q.length == BYTES.length() * 4 || q.length == BYTES.length() * 8) {
         for (int r = 0; r < rows; r++) {
-          int at = offset + r * len;
-          var s0 = popcount(q0, code(codes, at));
-          var s1 = popcount(q1, code(codes, at + step));
-          var s2 = popcount(q2, code(codes, at + 2 * step));
-          var s3 = popcount(q3, code(codes, at + 3 * step));
-          out[r] = (int) s0.add(s1).add(s2.add(s3)).reduceLanes(VectorOperators.ADD);
+          out[r] = hamming(q, codes, offset + r * q.length);
         }
         return;
       }
-      if (q.length == BYTES.length() * 8) {
-        var q0 = query(q, 0);
-        var q1 = query(q, BYTES.length());
-        var q2 = query(q, 2 * BYTES.length());
-        var q3 = query(q, 3 * BYTES.length());
-        var q4 = query(q, 4 * BYTES.length());
-        var q5 = query(q, 5 * BYTES.length());
-        var q6 = query(q, 6 * BYTES.length());
-        var q7 = query(q, 7 * BYTES.length());
-        for (int r = 0; r < rows; r++) {
-          int at = offset + r * q.length;
-          var s0 = popcount(q0, code(codes, at));
-          var s1 = popcount(q1, code(codes, at + BYTES.length()));
-          var s2 = popcount(q2, code(codes, at + 2 * BYTES.length()));
-          var s3 = popcount(q3, code(codes, at + 3 * BYTES.length()));
-          var s4 = popcount(q4, code(codes, at + 4 * BYTES.length()));
-          var s5 = popcount(q5, code(codes, at + 5 * BYTES.length()));
-          var s6 = popcount(q6, code(codes, at + 6 * BYTES.length()));
-          var s7 = popcount(q7, code(codes, at + 7 * BYTES.length()));
-          out[r] =
-              (int)
-                  s0.add(s1)
-                      .add(s2.add(s3))
-                      .add(s4.add(s5).add(s6.add(s7)))
-                      .reduceLanes(VectorOperators.ADD);
+      if ((q.length & 31) == 0) {
+        int r = 0;
+        for (; r + 4 <= rows; r += 4) {
+          int row0 = offset + r * q.length;
+          int row1 = row0 + q.length, row2 = row1 + q.length, row3 = row2 + q.length;
+          var sum0 = LongVector.zero(LONGS);
+          var sum1 = LongVector.zero(LONGS);
+          var sum2 = LongVector.zero(LONGS);
+          var sum3 = LongVector.zero(LONGS);
+          int i = 0;
+          for (; i <= q.length - BYTES.length(); i += BYTES.length()) {
+            var query = query(q, i);
+            sum0 = sum0.add(popcount(query, code(codes, row0 + i)));
+            sum1 = sum1.add(popcount(query, code(codes, row1 + i)));
+            sum2 = sum2.add(popcount(query, code(codes, row2 + i)));
+            sum3 = sum3.add(popcount(query, code(codes, row3 + i)));
+          }
+          int score0 = (int) sum0.reduceLanes(VectorOperators.ADD);
+          int score1 = (int) sum1.reduceLanes(VectorOperators.ADD);
+          int score2 = (int) sum2.reduceLanes(VectorOperators.ADD);
+          int score3 = (int) sum3.reduceLanes(VectorOperators.ADD);
+          for (; i < q.length; i++) {
+            int query = q[i];
+            score0 += Integer.bitCount((query ^ codes[row0 + i]) & 255);
+            score1 += Integer.bitCount((query ^ codes[row1 + i]) & 255);
+            score2 += Integer.bitCount((query ^ codes[row2 + i]) & 255);
+            score3 += Integer.bitCount((query ^ codes[row3 + i]) & 255);
+          }
+          out[r] = score0;
+          out[r + 1] = score1;
+          out[r + 2] = score2;
+          out[r + 3] = score3;
         }
+        for (; r < rows; r++) out[r] = hamming(q, codes, offset + r * q.length);
         return;
       }
       super.hamming(q, codes, offset, rows, out);

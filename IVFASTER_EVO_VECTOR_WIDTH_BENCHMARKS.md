@@ -82,3 +82,24 @@ product, allowing core to select its native-width implementation.
 
 The coarse Hamming scan also includes IVFaster's four-vector shape for a
 256-byte Nitrox2 row under 512-bit species.
+
+## Dimension scaling
+
+Benchmarked on September 23, 2026 with 1M vectors, 200 queries, 256-bit
+preferred species, `nlist=1000`, `nprobe=45`, `topK=100`, `fanout=100`,
+`bruteN=700`, and INT8 fine codes. The 256- and 768-dimensional corpora are
+prefix truncations of the 1024-dimensional Cohere corpus, so recall values are
+only comparable within each dimension; latency is the cross-dimension result
+of interest.
+
+| Dimensions | Recall | Latency | Indexing | Force merge |
+|---:|---:|---:|---:|---:|
+| 256 | 0.802 | 0.835 ms | 10.39 s | 6.11 s |
+| 768 | 0.935 | 1.035 ms | 14.93 s | 11.52 s |
+| 1024 | 0.945 | 1.075 ms | 20.51 s | 14.78 s |
+
+The coarse scan uses a four-row, fixed-register-pressure loop for arbitrary
+multiples of 128 dimensions. Exact four- and eight-preferred-vector shapes
+retain their fully unrolled query-register paths. This removes the generic
+per-row fallback for dimensions such as 768 without regressing the tuned
+1024-dimensional shape.
