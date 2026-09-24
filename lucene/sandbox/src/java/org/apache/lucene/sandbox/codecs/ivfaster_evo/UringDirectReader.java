@@ -36,8 +36,10 @@ import java.util.Locale;
  *
  * <p>Used for the scattered fine-record reads of a rerank: one submission covers every record of
  * the batch, so the reads run in parallel on the device, and {@code O_DIRECT} keeps them out of the
- * page cache, where they would otherwise evict the RAM-resident coarse codes. Rings and destination
- * buffers are per thread and file-agnostic; each reader only owns its file descriptor.
+ * page cache, where they would otherwise evict the RAM-resident coarse codes. This only pays off
+ * when the fine tier is larger than RAM; enabled by {@code -Divfaster.evo.uringFine=true}. Rings
+ * and destination buffers are per thread and file-agnostic; each reader only owns its file
+ * descriptor.
  */
 @SuppressWarnings("restricted")
 final class UringDirectReader implements Closeable {

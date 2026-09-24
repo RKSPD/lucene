@@ -18,8 +18,19 @@
 package org.apache.lucene.sandbox.codecs.ivfaster_evo;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.Callable;
+import org.apache.lucene.codecs.KnnVectorsReader;
+import org.apache.lucene.index.CodecReader;
+import org.apache.lucene.index.FilterLeafReader;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.sandbox.codecs.ivfaster_evo.IVFasterEvoVectorsFormat.SearchStrategy;
+import org.apache.lucene.sandbox.codecs.ivfaster_evo.IVFasterEvoVectorsReader.Candidates;
 import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.search.BooleanClause.Occur;
 import org.apache.lucene.search.BooleanQuery;
@@ -31,18 +42,28 @@ import org.apache.lucene.search.LeafCollector;
 import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.Scorable;
+import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.ScoreMode;
+import org.apache.lucene.search.TimeLimitingKnnCollectorManager;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TopDocsCollector;
+import org.apache.lucene.search.TopKnnCollector;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.search.knn.KnnCollectorManager;
 import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.FixedBitSet;
 
 /**
- * A {@link KnnFloatVectorQuery} for IVFasterEvo fields that hands dense filters to the codec as a
- * per-segment bit set, so the reader can choose between a filtered cell scan and visiting the
- * accepted documents directly.
+ * A {@link KnnFloatVectorQuery} for IVFasterEvo fields.
+ *
+ * <p>Without a filter, every segment scans its probe cells and contributes its deduplicated coarse
+ * shortlist; the shortlists are merged by coarse distance into one index-wide shortlist of {@value
+ * IVFasterEvoVectorsReader#SHORTLIST} candidates, and only those fine records are read and scored.
+ * Fine reads per query therefore stay constant as the segment count grows, instead of scaling with
+ * it as per-segment reranking would.
+ *
+ * <p>A dense filter is handed to the codec as a per-segment bit set, so the reader can choose
+ * between a filtered cell scan and visiting the accepted documents directly.
  *
  * <p>If the filter intersected with the field rewrites to a single clause, the query falls back to
  * a plain {@link KnnFloatVectorQuery}. Segments where at most {@code k} documents match are
@@ -53,46 +74,168 @@ import org.apache.lucene.util.FixedBitSet;
 public final class IVFasterEvoKnnQuery extends KnnFloatVectorQuery {
   private final Query denseFilter;
   private final Weight filterWeight;
+  private final Map<Integer, TopDocs> reranked;
 
   /** Creates a query probing {@code numProbes} cells, with an optional (possibly null) filter. */
   public IVFasterEvoKnnQuery(String field, float[] target, int k, Query filter, int numProbes) {
-    super(field, target, k, null, new IVFasterEvoVectorsFormat.SearchStrategy(numProbes));
-    this.denseFilter = filter;
-    this.filterWeight = null;
+    this(field, target, k, filter, new SearchStrategy(numProbes));
   }
 
-  /** Carries a rewritten filter weight into segment search. */
-  private IVFasterEvoKnnQuery(IVFasterEvoKnnQuery query, Weight filterWeight) {
+  /** Creates a query with an explicit probe strategy and an optional (possibly null) filter. */
+  public IVFasterEvoKnnQuery(
+      String field, float[] target, int k, Query filter, SearchStrategy strategy) {
+    super(field, target, k, null, Objects.requireNonNull(strategy));
+    this.denseFilter = filter;
+    this.filterWeight = null;
+    this.reranked = null;
+  }
+
+  /** Carries a rewritten filter weight, or finished global rerank results, into segment search. */
+  private IVFasterEvoKnnQuery(
+      IVFasterEvoKnnQuery query, Weight filterWeight, Map<Integer, TopDocs> reranked) {
     super(query.field, query.target, query.k, null, query.searchStrategy);
     this.denseFilter = query.denseFilter;
     this.filterWeight = filterWeight;
+    this.reranked = reranked;
   }
 
   /** Intersects the filter with the field and pre-creates its weight for segment search. */
   @Override
   public Query rewrite(IndexSearcher searcher) throws IOException {
-    if (denseFilter == null || filterWeight != null) return super.rewrite(searcher);
-    var both = new BooleanQuery.Builder();
-    both.add(denseFilter, Occur.FILTER).add(new FieldExistsQuery(field), Occur.FILTER);
-    Query rewritten = searcher.rewrite(both.build());
-    if (rewritten.getClass() == MatchNoDocsQuery.class) return rewritten;
-    if ((rewritten instanceof BooleanQuery b && b.clauses().size() > 1) == false) {
-      return new KnnFloatVectorQuery(field, target, k, denseFilter, searchStrategy)
-          .rewrite(searcher);
+    if (reranked != null || filterWeight != null) return super.rewrite(searcher);
+    Weight filter = null;
+    if (denseFilter != null) {
+      var both = new BooleanQuery.Builder();
+      both.add(denseFilter, Occur.FILTER).add(new FieldExistsQuery(field), Occur.FILTER);
+      Query rewritten = searcher.rewrite(both.build());
+      if (rewritten.getClass() == MatchNoDocsQuery.class) return rewritten;
+      filter = rewritten.createWeight(searcher, ScoreMode.COMPLETE_NO_SCORES, 1f);
     }
-    Weight weight = rewritten.createWeight(searcher, ScoreMode.COMPLETE_NO_SCORES, 1f);
-    return new IVFasterEvoKnnQuery(this, weight).rewrite(searcher);
+    Map<Integer, TopDocs> global = globalRerank(searcher, filter);
+    if (global != null) return new IVFasterEvoKnnQuery(this, null, global).rewrite(searcher);
+    // Some segment is not IVFasterEvo: search every segment on its own.
+    return filter == null
+        ? super.rewrite(searcher)
+        : new IVFasterEvoKnnQuery(this, filter, null).rewrite(searcher);
   }
 
-  /** Materializes the filter into a bit set, then searches exactly or approximately. */
+  /** Returns a segment's share of the finished global rerank, when there is one. */
+  @Override
+  protected TopDocs searchLeaf(
+      LeafReaderContext context, Weight filter, TimeLimitingKnnCollectorManager manager)
+      throws IOException {
+    if (reranked == null) return super.searchLeaf(context, filter, manager);
+    return reranked.getOrDefault(context.ord, TopDocsCollector.EMPTY_TOPDOCS);
+  }
+
+  /** Returns the segment's IVFasterEvo reader for this field, or null if it uses another codec. */
+  private IVFasterEvoVectorsReader evoReader(LeafReaderContext context) {
+    if (FilterLeafReader.unwrap(context.reader()) instanceof CodecReader codec) {
+      KnnVectorsReader vectors = codec.getVectorReader();
+      if (vectors != null
+          && vectors.unwrapReaderForField(field) instanceof IVFasterEvoVectorsReader r) {
+        return r;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Merges every segment's coarse shortlist into one index-wide shortlist and fine-reranks only
+   * that, returning each segment's top hits with global doc IDs, or null when some segment is not
+   * searched by IVFasterEvo.
+   */
+  private Map<Integer, TopDocs> globalRerank(IndexSearcher searcher, Weight filter)
+      throws IOException {
+    List<LeafReaderContext> leaves = new ArrayList<>();
+    List<IVFasterEvoVectorsReader> readers = new ArrayList<>();
+    for (LeafReaderContext context : searcher.getIndexReader().leaves()) {
+      if (context.reader().getFieldInfos().fieldInfo(field) == null) continue;
+      IVFasterEvoVectorsReader evo = evoReader(context);
+      if (evo == null) return null;
+      leaves.add(context);
+      readers.add(evo);
+    }
+    SearchStrategy strategy = (SearchStrategy) searchStrategy;
+    List<Callable<Candidates>> scans = new ArrayList<>(leaves.size());
+    for (int l = 0; l < leaves.size(); l++) {
+      LeafReaderContext context = leaves.get(l);
+      IVFasterEvoVectorsReader reader = readers.get(l);
+      scans.add(
+          () -> {
+            AcceptDocs accept = accepted(context, filter);
+            return accept == null
+                ? new Candidates(new int[0], new int[0])
+                : reader.candidates(field, target, strategy, accept);
+          });
+    }
+    List<Candidates> candidates = searcher.getTaskExecutor().invokeAll(scans);
+
+    // Keep the globally nearest candidates by coarse distance: (distance, segment, position).
+    int total = 0;
+    for (Candidates c : candidates) total += c.slots().length;
+    long[] ranked = new long[total];
+    for (int l = 0, at = 0; l < candidates.size(); l++) {
+      int[] distances = candidates.get(l).distances();
+      for (int i = 0; i < distances.length; i++) {
+        ranked[at++] = (long) distances[i] << 40 | (long) l << 20 | i;
+      }
+    }
+    Arrays.sort(ranked);
+    int keep = Math.min(total, Math.max(k, IVFasterEvoVectorsReader.SHORTLIST));
+    int[] counts = new int[leaves.size()];
+    for (int i = 0; i < keep; i++) counts[(int) (ranked[i] >>> 20) & 0xFFFFF]++;
+    int[][] slots = new int[leaves.size()][];
+    for (int l = 0; l < slots.length; l++) slots[l] = new int[counts[l]];
+    Arrays.fill(counts, 0);
+    for (int i = 0; i < keep; i++) {
+      int l = (int) (ranked[i] >>> 20) & 0xFFFFF;
+      slots[l][counts[l]++] = candidates.get(l).slots()[(int) ranked[i] & 0xFFFFF];
+    }
+
+    List<Callable<TopDocs>> reranks = new ArrayList<>();
+    List<Integer> ords = new ArrayList<>();
+    for (int l = 0; l < leaves.size(); l++) {
+      if (slots[l].length == 0) continue;
+      LeafReaderContext context = leaves.get(l);
+      IVFasterEvoVectorsReader reader = readers.get(l);
+      int[] leafSlots = slots[l];
+      ords.add(context.ord);
+      reranks.add(
+          () -> {
+            TopKnnCollector collector = new TopKnnCollector(k, Integer.MAX_VALUE, strategy);
+            reader.rerank(field, target, leafSlots, collector);
+            TopDocs hits = collector.topDocs();
+            for (ScoreDoc hit : hits.scoreDocs) hit.doc += context.docBase;
+            return hits;
+          });
+    }
+    List<TopDocs> hits = searcher.getTaskExecutor().invokeAll(reranks);
+    Map<Integer, TopDocs> byLeaf = new HashMap<>();
+    for (int i = 0; i < hits.size(); i++) byLeaf.put(ords.get(i), hits.get(i));
+    return byLeaf;
+  }
+
+  /** Searches one segment on its own, with the filter materialized into a bit set. */
   @Override
   protected TopDocs approximateSearch(
       LeafReaderContext context, AcceptDocs live, int limit, KnnCollectorManager manager)
       throws IOException {
     if (filterWeight == null) return super.approximateSearch(context, live, limit, manager);
-    BulkScorer scorer = filterWeight.bulkScorer(context);
-    if (scorer == null) return TopDocsCollector.EMPTY_TOPDOCS;
+    AcceptDocs accept = accepted(context, filterWeight);
+    if (accept == null) return TopDocsCollector.EMPTY_TOPDOCS;
+    return super.approximateSearch(context, accept, accept.cost() + 1, manager);
+  }
+
+  /**
+   * Returns the segment's live documents, intersected with the filter as a bit set when there is
+   * one, or null when nothing in the segment is accepted.
+   */
+  private static AcceptDocs accepted(LeafReaderContext context, Weight filter) throws IOException {
     int maxDoc = context.reader().maxDoc();
+    if (filter == null) return AcceptDocs.fromLiveDocs(context.reader().getLiveDocs(), maxDoc);
+    BulkScorer scorer = filter.bulkScorer(context);
+    if (scorer == null) return null;
     FixedBitSet accepted = new FixedBitSet(maxDoc);
     LeafCollector collector =
         new LeafCollector() {
@@ -104,11 +247,10 @@ public final class IVFasterEvoKnnQuery extends KnnFloatVectorQuery {
             accepted.set(doc);
           }
         };
-    scorer.score(collector, live.bits(), 0, maxDoc);
+    scorer.score(collector, context.reader().getLiveDocs(), 0, maxDoc);
     int n = accepted.cardinality();
-    if (n <= k) return exactSearch(context, new BitSetIterator(accepted, n), null);
-    var it = AcceptDocs.fromIteratorSupplier(() -> new BitSetIterator(accepted, n), null, maxDoc);
-    return super.approximateSearch(context, it, n + 1, manager);
+    if (n == 0) return null;
+    return AcceptDocs.fromIteratorSupplier(() -> new BitSetIterator(accepted, n), null, maxDoc);
   }
 
   /** Formats the query and its dense filter. */

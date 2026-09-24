@@ -39,9 +39,12 @@ import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.sandbox.codecs.ivfaster_evo.IVFasterEvoVectorsFormat.FineTier;
 import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.KnnFloatVectorQuery;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.SortField;
+import org.apache.lucene.search.TermQuery;
+import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TopKnnCollector;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.util.LuceneTestCase;
@@ -214,6 +217,96 @@ public class TestIVFasterEvoVectorsFormat extends LuceneTestCase {
               10, Integer.MAX_VALUE, new IVFasterEvoVectorsFormat.SearchStrategy(8));
       getOnlyLeafReader(reader).searchNearestVectors("v", target, collector, null);
       return collector.topDocs().scoreDocs;
+    }
+  }
+
+  public void testGlobalRerankMatchesSegmentRerankOnOneSegment() throws Exception {
+    try (Directory dir = newDirectory();
+        IndexWriter writer = new IndexWriter(dir, config(FineTier.INT8, 8, false))) {
+      for (int i = 0; i < 3000; i++) {
+        Document doc = new Document();
+        doc.add(new KnnFloatVectorField("v", randomVector(), VectorSimilarityFunction.COSINE));
+        writer.addDocument(doc);
+      }
+      writer.forceMerge(1);
+      try (DirectoryReader reader = DirectoryReader.open(writer)) {
+        var searcher = newSearcher(reader);
+        var strategy = new IVFasterEvoVectorsFormat.SearchStrategy(4, 0.9f);
+        float[] target = randomVector();
+        TopDocs segment =
+            searcher.search(new KnnFloatVectorQuery("v", target, 10, null, strategy), 10);
+        TopDocs global =
+            searcher.search(new IVFasterEvoKnnQuery("v", target, 10, null, strategy), 10);
+        assertEquals(segment.scoreDocs.length, global.scoreDocs.length);
+        for (int i = 0; i < segment.scoreDocs.length; i++) {
+          assertEquals(segment.scoreDocs[i].doc, global.scoreDocs[i].doc);
+          assertEquals(segment.scoreDocs[i].score, global.scoreDocs[i].score, 0f);
+        }
+      }
+    }
+  }
+
+  public void testGlobalRerankAcrossSegmentsIsExactWhenEverythingIsReranked() throws Exception {
+    try (Directory dir = newDirectory();
+        IndexWriter writer = new IndexWriter(dir, config(FineTier.FP32, 8, false))) {
+      List<float[]> vectors = new ArrayList<>();
+      for (int i = 0; i < 150; i++) {
+        float[] vector = VectorUtil.l2normalize(randomVector());
+        vectors.add(vector);
+        Document doc = new Document();
+        doc.add(new KnnFloatVectorField("v", vector, VectorSimilarityFunction.COSINE));
+        doc.add(new NumericDocValuesField("id", i));
+        writer.addDocument(doc);
+        if (i % 50 == 49) writer.commit();
+      }
+      try (DirectoryReader reader = DirectoryReader.open(writer)) {
+        float[] target = VectorUtil.l2normalize(randomVector());
+        var strategy = new IVFasterEvoVectorsFormat.SearchStrategy(8, 1f);
+        TopDocs hits =
+            newSearcher(reader)
+                .search(new IVFasterEvoKnnQuery("v", target, 10, null, strategy), 10);
+        List<Float> expected = new ArrayList<>();
+        for (float[] vector : vectors) {
+          expected.add(VectorSimilarityFunction.COSINE.compare(target, vector));
+        }
+        expected.sort(Comparator.reverseOrder());
+        assertEquals(10, hits.scoreDocs.length);
+        for (int i = 0; i < 10; i++) assertEquals(expected.get(i), hits.scoreDocs[i].score, 1e-4f);
+      }
+    }
+  }
+
+  public void testFilteredGlobalRerankAcrossSegmentsIsExactWhenEverythingIsReranked()
+      throws Exception {
+    try (Directory dir = newDirectory();
+        IndexWriter writer = new IndexWriter(dir, config(FineTier.FP32, 8, false))) {
+      List<float[]> vectors = new ArrayList<>();
+      for (int i = 0; i < 3000; i++) {
+        float[] vector = VectorUtil.l2normalize(randomVector());
+        vectors.add(vector);
+        Document doc = new Document();
+        doc.add(new KnnFloatVectorField("v", vector, VectorSimilarityFunction.COSINE));
+        doc.add(new NumericDocValuesField("id", i));
+        doc.add(new StringField("keep", i % 7 == 0 ? "y" : "n", Field.Store.NO));
+        writer.addDocument(doc);
+        if (i % 1000 == 999) writer.commit();
+      }
+      try (DirectoryReader reader = DirectoryReader.open(writer)) {
+        float[] target = VectorUtil.l2normalize(randomVector());
+        var filter = new TermQuery(new Term("keep", "y"));
+        var strategy = new IVFasterEvoVectorsFormat.SearchStrategy(8, 1f);
+        var searcher = newSearcher(reader);
+        TopDocs hits =
+            searcher.search(new IVFasterEvoKnnQuery("v", target, 10, filter, strategy), 10);
+        List<Float> expected = new ArrayList<>();
+        for (int i = 0; i < vectors.size(); i += 7) {
+          expected.add(VectorSimilarityFunction.COSINE.compare(target, vectors.get(i)));
+        }
+        expected.sort(Comparator.reverseOrder());
+        assertEquals(10, hits.scoreDocs.length);
+        // Scores equal to the filtered brute force also show no unfiltered document leaked in.
+        for (int i = 0; i < 10; i++) assertEquals(expected.get(i), hits.scoreDocs[i].score, 1e-4f);
+      }
     }
   }
 

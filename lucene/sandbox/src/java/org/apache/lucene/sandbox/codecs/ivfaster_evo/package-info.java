@@ -28,9 +28,20 @@
  * <p>At query time the target is rotated and encoded the same way. A navigation graph over the
  * centroid codes picks candidate cells, which are re-ranked by exact centroid distance and trimmed
  * to the probe count. The coarse codes of the probed cells are scanned with SIMD Hamming kernels,
- * and a shortlist of roughly 700 survivors is reranked with the fine tier. Dense filters (see
- * {@link org.apache.lucene.sandbox.codecs.ivfaster_evo.IVFasterEvoKnnQuery}) either scan the probed
- * cells under the filter or score the accepted documents directly, whichever is cheaper.
+ * and each segment keeps a deduplicated shortlist of its nearest survivors. Search through {@link
+ * org.apache.lucene.sandbox.codecs.ivfaster_evo.IVFasterEvoKnnQuery}: it merges every segment's
+ * shortlist into one index-wide shortlist of roughly 700 candidates and reranks only those with the
+ * fine tier, so fine reads per query do not grow with the segment count. A plain {@code
+ * KnnFloatVectorQuery} still works but reranks each segment's shortlist separately. Filters are
+ * applied before any scoring: each segment either scans the probed cells under the filter or ranks
+ * the accepted documents directly, whichever is cheaper, and the result joins the same global
+ * shortlist.
+ *
+ * <p>Coarse codes are read through the mapped index and are meant to stay in the page cache. For
+ * indexes whose fine tier is larger than RAM, {@code -Divfaster.evo.uringFine=true} reads fine
+ * records with batched io_uring {@code O_DIRECT} reads instead (Linux, v2 indexes, non-compound
+ * segments on a file-system directory), so reranks never evict the cached coarse codes. It is off
+ * by default: when the index fits in RAM, mapped reads are much faster.
  *
  * <p>To limit clustering cost, flushed segments seed clustering from the centroids of earlier
  * segments ("hot start"). Compatible merges copy encoded rows and warm-start from a donor segment,

@@ -74,20 +74,28 @@ import org.apache.lucene.util.packed.DirectMonotonicReader;
  * Filtered search chooses between scanning selected cells and visiting accepted documents directly.
  */
 final class IVFasterEvoVectorsReader extends KnnVectorsReader {
-  private static final int SHORTLIST = 700, ADMIT_BLOCK = 256, FILTERED_PROBE_MULTIPLIER = 8;
+  /** Coarse candidates fine-reranked per query: per segment, or across segments globally. */
+  static final int SHORTLIST = 700;
+
+  private static final int ADMIT_BLOCK = 256, FILTERED_PROBE_MULTIPLIER = 8;
   private static final int VERIFY_MIN = 64, VERIFY_MULTIPLIER = 2;
   private static final int DEDUP_MASK = (Integer.highestOneBit(SHORTLIST) << 2) - 1;
   private static final Kernels K = Kernels.INSTANCE;
   private static final boolean REPORT_ENGAGEMENT = Boolean.getBoolean("ivfaster.reportEngagement");
 
   /**
-   * Opt-in: read fine records with io_uring O_DIRECT so they never displace cached coarse codes.
+   * Opt-in, for indexes whose fine tier is larger than RAM: read fine records with io_uring
+   * O_DIRECT so reranks never evict the cached coarse codes. Leave it off when the index fits in
+   * RAM, where mapped reads are much faster.
    */
   static final String URING_FINE_PROPERTY = "ivfaster.evo.uringFine";
 
   private static final AtomicLong SCAN_QUERIES = new AtomicLong(),
       SCANNED_SLOTS = new AtomicLong(),
       PROBED_CELLS = new AtomicLong();
+
+  /** A segment's deduplicated coarse shortlist: record slots and their coarse distances. */
+  record Candidates(int[] slots, int[] distances) {}
 
   private final Map<String, Field> fields = new HashMap<>();
   private final IndexInput data;
@@ -303,6 +311,10 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
       final byte[] qCode = new byte[coarseBytes];
       final FineCodec.Query fine;
       final KnnCollector collector;
+
+      /** Set instead of reranking when the shortlist is gathered for a cross-segment rerank. */
+      Candidates gathered;
+
       final Scratch scratch = Scratch.LOCAL.get();
       final int bins = coarseBytes * 8 + 2, pool = SHORTLIST * (1 + spillBits);
       final int[] histogram = scratch.histogram = ArrayUtil.growNoCopy(scratch.histogram, bins);
@@ -327,12 +339,15 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
 
       /** Chooses the filtered or unfiltered search path and executes it. */
       void run(AcceptDocs acceptDocs) throws IOException {
-        int probe = nprobe;
-        float margin = DEFAULT_PROBE_MARGIN;
         if (collector.getSearchStrategy() instanceof SearchStrategy strategy) {
-          probe = strategy.numProbes;
-          margin = strategy.probeMargin;
+          run(strategy.numProbes, strategy.probeMargin, acceptDocs);
+        } else {
+          run(nprobe, DEFAULT_PROBE_MARGIN, acceptDocs);
         }
+      }
+
+      /** Runs the filtered or unfiltered search path for an explicit probe count and margin. */
+      private void run(int probe, float margin, AcceptDocs acceptDocs) throws IOException {
         probe = Math.min(probe, nlist);
         Bits accept = acceptDocs == null ? null : acceptDocs.bits();
         if (accept instanceof BitSet filter) {
@@ -355,7 +370,11 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
             slots = ArrayUtil.grow(slots, n + 1);
             slots[n++] = ordToSlot[ord];
           }
-          rerank(slots, n);
+          if (collector == null) {
+            admitAll(slots, n);
+          } else {
+            rerank(slots, n);
+          }
         } else {
           scan(selectCells(probe, margin), accept);
         }
@@ -469,6 +488,28 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
         rerankPool(Math.min(pool, total), liveDocs);
       }
 
+      /**
+       * Admits every given slot by its coarse distance, so directly visited filter matches join a
+       * cross-segment shortlist on the same terms as scanned candidates.
+       */
+      private void admitAll(int[] slots, int n) throws IOException {
+        long[] packed = scratch.packed = ArrayUtil.growNoCopy(scratch.packed, n);
+        int[] distance = new int[1];
+        scratch.bytes = ArrayUtil.growNoCopy(scratch.bytes, coarseBytes);
+        for (int i = 0; i < n; i++) {
+          MemorySegment run = coarseRun(slots[i], 1);
+          if (run != null) {
+            K.hamming(qCode, run, runBase(slots[i]), 1, distance);
+          } else {
+            coarse.readBytes((long) slots[i] * coarseBytes, scratch.bytes, 0, coarseBytes);
+            distance[0] = K.hamming(qCode, scratch.bytes, 0);
+          }
+          histogram[distance[0]]++;
+          packed[size++] = ((long) distance[0] << 32) | slots[i];
+        }
+        rerankPool(Math.min(pool, n), null);
+      }
+
       /** Orders, deduplicates, and fine-reranks the coarse candidate pool. */
       private void rerankPool(int need, Bits live) throws IOException {
         int[] next = scratch.prefix = ArrayUtil.growNoCopy(scratch.prefix, bins + 1);
@@ -483,12 +524,22 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
           if (d < cut || (d == cut && ties-- > 0)) ordered[next[d]++] = scratch.packed[i];
         }
         scratch.newDedup();
-        int[] shortlist = scratch.shortlist;
+        int[] shortlist = scratch.shortlist, distances = scratch.shortlistDistances;
         for (int i = 0; i < next[cut] && n < SHORTLIST; i++) {
           int slot = (int) ordered[i], doc = docAt(slot);
-          if ((live == null || live.get(doc)) && scratch.addDistinct(doc)) shortlist[n++] = slot;
+          if ((live == null || live.get(doc)) && scratch.addDistinct(doc)) {
+            distances[n] = (int) (ordered[i] >>> 32);
+            shortlist[n++] = slot;
+          }
         }
-        rerank(shortlist, n);
+        if (collector == null) {
+          gathered =
+              new Candidates(
+                  ArrayUtil.copyOfSubArray(shortlist, 0, n),
+                  ArrayUtil.copyOfSubArray(distances, 0, n));
+        } else {
+          rerank(shortlist, n);
+        }
       }
 
       /** Fine-reranks record slots and sends their scores to the collector. */
@@ -698,6 +749,7 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
     int[] histogram = new int[0], prefix = new int[0], distances = new int[0];
     int[] candidates = new int[0], coarse = new int[0];
     int[] kept = new int[ADMIT_BLOCK], shortlist = new int[SHORTLIST];
+    int[] shortlistDistances = new int[SHORTLIST];
     int[] dedupKeys = new int[DEDUP_MASK + 1], dedupStamps = new int[DEDUP_MASK + 1];
     long[] packed = new long[0], ordered = new long[0];
     byte[] bytes = new byte[0];
@@ -735,6 +787,26 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
       throws IOException {
     Field field = field(name);
     if (field != null) field.new Search(target, collector).run(acceptDocs);
+  }
+
+  /**
+   * Runs this segment's filtered or unfiltered coarse search for {@code strategy} and returns its
+   * deduplicated shortlist of accepted documents, without reading any fine record, for a
+   * cross-segment rerank.
+   */
+  Candidates candidates(String name, float[] target, SearchStrategy strategy, AcceptDocs accept)
+      throws IOException {
+    Field field = field(name);
+    if (field == null) return new Candidates(new int[0], new int[0]);
+    Field.Search search = field.new Search(target, null);
+    search.run(strategy.numProbes, strategy.probeMargin, accept);
+    return search.gathered == null ? new Candidates(new int[0], new int[0]) : search.gathered;
+  }
+
+  /** Fine-reranks the given record slots of this segment into {@code collector}. */
+  void rerank(String name, float[] target, int[] slots, KnnCollector collector) throws IOException {
+    Field field = field(name);
+    if (field != null) field.new Search(target, collector).rerank(slots, slots.length);
   }
 
   /** Opens a nonempty field by name. */
