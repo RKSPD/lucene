@@ -38,7 +38,7 @@ final class Centroids {
    * Keeps centroid representations together so routing can shortlist cheaply and verify accurately.
    */
   static final class CentroidCodes {
-    static final int TILE = 512;
+    private static final int TILE = 512;
 
     final float[][] centroids;
     final byte[] coarse;
@@ -84,6 +84,7 @@ final class Centroids {
       for (int i = 0; i < count; i++) out[i] = -out[i];
     }
 
+    /** Holds the nearest routed cells and the top-two exact distances. */
     static final class Routing {
       final int[] cells;
       int count, cell2;
@@ -95,8 +96,9 @@ final class Centroids {
       }
     }
 
+    /** Reusable buffers for shortlisting and verifying routed centroids. */
     static final class Scratch {
-      final int[] coarseDist = new int[TILE], verifyCells, verifyIds;
+      final int[] coarseDist = new int[TILE], verifyCells;
       final long[] heap;
       final float[] verifyDist;
       final byte[] qCode;
@@ -105,7 +107,6 @@ final class Centroids {
       Scratch(int dim, int nlist, int shortlist) {
         heap = new long[shortlist];
         verifyCells = new int[shortlist];
-        verifyIds = new int[shortlist];
         verifyDist = new float[shortlist];
         qCode = new byte[Nitrox2.bytesPerVector(dim)];
       }
@@ -130,28 +131,19 @@ final class Centroids {
               worst = (int) (heap[0] >>> 32);
             }
           } else if (dist < worst) {
-            heap[0] = ((long) dist << 32) | (base + r);
-            siftDown(heap, 0, heapSize);
+            CentroidGraph.siftDown(heap, 0, heapSize, ((long) dist << 32) | (base + r), true);
             worst = (int) (heap[0] >>> 32);
           }
         }
       }
       final int[] cells = scratch.verifyCells;
       final float[] dists = scratch.verifyDist;
-      for (int i = 0; i < heapSize; i++) scratch.verifyIds[i] = (int) heap[i];
-      int n = 0;
-      for (int i = 0; i < heapSize; i++) {
-        final int c = scratch.verifyIds[i];
-        final float d = exactDistance(vector, c);
-        int j = n++;
-        while (j > 0 && dists[j - 1] > d) {
-          dists[j] = dists[j - 1];
-          cells[j] = cells[j - 1];
-          j--;
-        }
-        dists[j] = d;
-        cells[j] = c;
+      final int n = heapSize;
+      for (int i = 0; i < n; i++) {
+        cells[i] = (int) heap[i];
+        dists[i] = exactDistance(vector, cells[i]);
       }
+      CentroidGraph.sortByDistance(dists, cells, n);
       int k = Math.min(keep, n);
       System.arraycopy(cells, 0, out.cells, 0, k);
       out.count = k;
@@ -162,22 +154,9 @@ final class Centroids {
 
     /** Builds a max heap from packed distance and centroid pairs. */
     private static void heapify(long[] heap, int size) {
-      for (int i = (size >>> 1) - 1; i >= 0; i--) siftDown(heap, i, size);
-    }
-
-    /** Restores max-heap order below one position. */
-    private static void siftDown(long[] heap, int i, int size) {
-      final long value = heap[i];
-      while (true) {
-        int child = (i << 1) + 1;
-        if (child >= size) break;
-        int right = child + 1;
-        if (right < size && heap[right] > heap[child]) child = right;
-        if (heap[child] <= value) break;
-        heap[i] = heap[child];
-        i = child;
+      for (int i = (size >>> 1) - 1; i >= 0; i--) {
+        CentroidGraph.siftDown(heap, i, size, heap[i], true);
       }
-      heap[i] = value;
     }
 
     /** Returns negative dot product as the centroid distance. */
@@ -300,7 +279,7 @@ final class Centroids {
     }
 
     /** Sorts centroid IDs by ascending distance. */
-    static void sortByDistance(float[] dist, int[] ids, int n) {
+    private static void sortByDistance(float[] dist, int[] ids, int n) {
       for (int i = 1; i < n; i++) {
         float d = dist[i];
         int c = ids[i], j = i - 1;
@@ -419,7 +398,7 @@ final class Centroids {
     }
 
     /** Replaces a heap root and restores min- or max-heap order. */
-    static void siftDown(long[] h, int i, int size, long v, boolean max) {
+    private static void siftDown(long[] h, int i, int size, long v, boolean max) {
       for (int child; (child = (i << 1) + 1) < size; i = child) {
         if (child + 1 < size && (max ? h[child + 1] > h[child] : h[child + 1] < h[child])) child++;
         if (max ? h[child] <= v : h[child] >= v) break;

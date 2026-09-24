@@ -16,29 +16,38 @@
  */
 
 /**
- * An inverted-file vector format optimized for low-latency approximate nearest-neighbor search.
+ * IVFasterEvo, a two-tier inverted-file (IVF) vector format for low-latency approximate
+ * nearest-neighbor search.
  *
- * <p>At index time, IVFasterEvo rotates normalized vectors, clusters them around centroids, and
- * stores each vector in its primary cell plus a small number of spill cells. At query time it
- * follows the same rotation, chooses nearby cells, scans their compact coarse codes, and reranks a
- * bounded shortlist with the fine representation.
+ * <p>Vectors are normalized and randomly rotated with a Hadamard transform, clustered into cells,
+ * and written to their primary cell plus up to {@code spillBits} spill cells near cell boundaries.
+ * Each stored slot carries two encodings: a Nitrox2 coarse code (two bits per dimension, a sign bit
+ * and a magnitude bit, compared by XOR and popcount Hamming distance) and a fine INT8 or FP32
+ * vector. A persisted slot-to-document section maps scan results back to doc IDs.
  *
- * <p>The coarse tier is Nitrox2, an extended Hamming code with a sign bit and a magnitude bit. Its
- * layout is designed around a high-CPU-memory-bandwidth XOR and popcount scan, allowing SIMD to
- * reject most candidates with very low latency. The remaining candidates use either INT8 or FP32
- * fine vectors for reranking.
+ * <p>At query time the target is rotated and encoded the same way. A navigation graph over the
+ * centroid codes picks candidate cells, which are re-ranked by exact centroid distance and trimmed
+ * to the probe count. The coarse codes of the probed cells are scanned with SIMD Hamming kernels,
+ * and a shortlist of roughly 700 survivors is reranked with the fine tier. Dense filters (see
+ * {@link org.apache.lucene.sandbox.codecs.ivfaster_evo.IVFasterEvoKnnQuery}) either scan the probed
+ * cells under the filter or score the accepted documents directly, whichever is cheaper.
  *
- * <p>The main implementation pieces are:
+ * <p>To limit clustering cost, flushed segments seed clustering from the centroids of earlier
+ * segments ("hot start"). Compatible merges copy encoded rows and warm-start from a donor segment,
+ * with centroids averaged across same-lineage segments weighted by their live cell populations.
+ *
+ * <p>Main components:
  *
  * <ul>
- *   <li>{@link org.apache.lucene.sandbox.codecs.ivfaster_evo.IVFasterEvoVectorsFormat} configures
- *       clustering, probing, spilling, and the fine tier.
- *   <li>{@code Clustering} builds cells and secondary spill assignments.
- *   <li>{@code Centroids} encodes centroids and builds the graph used to select probe cells.
- *   <li>{@code IVFasterEvoVectorsWriter} stages, clusters, and persists vectors.
- *   <li>{@code IVFasterEvoVectorsReader} performs coarse scans and fine reranking.
- *   <li>{@code HotStart} reuses centroid state across flushes and merges so clustering work is not
- *       discarded when the index is split into segments.
+ *   <li>{@link org.apache.lucene.sandbox.codecs.ivfaster_evo.IVFasterEvoVectorsFormat}: format
+ *       configuration and per-query {@code SearchStrategy}.
+ *   <li>{@code IVFasterEvoVectorsWriter}: stages, clusters, encodes, and persists vectors.
+ *   <li>{@code IVFasterEvoVectorsReader}: cell selection, coarse scan, and fine rerank.
+ *   <li>{@code Clustering}: iterative spherical clustering with spill assignment.
+ *   <li>{@code Centroids}: centroid codes, routing, and the centroid navigation graph.
+ *   <li>{@code Tiers}: the Nitrox2 and fine encodings and the Hadamard rotation.
+ *   <li>{@code Kernels}: scalar kernels with Panama Vector API replacements.
+ *   <li>{@code HotStart}: centroid state retained across flushes and merges.
  * </ul>
  *
  * @lucene.experimental

@@ -28,15 +28,18 @@ import org.apache.lucene.document.Field;
 import org.apache.lucene.document.KnnFloatVectorField;
 import org.apache.lucene.document.NumericDocValuesField;
 import org.apache.lucene.document.StringField;
+import org.apache.lucene.index.CodecReader;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReader;
+import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.sandbox.codecs.ivfaster_evo.IVFasterEvoVectorsFormat.FineTier;
 import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.SortField;
 import org.apache.lucene.search.TopKnnCollector;
@@ -131,6 +134,89 @@ public class TestIVFasterEvoVectorsFormat extends LuceneTestCase {
     }
   }
 
+  public void testExactScorerMatchesUnrotatedFp32Vectors() throws Exception {
+    for (VectorSimilarityFunction similarity :
+        new VectorSimilarityFunction[] {
+          VectorSimilarityFunction.COSINE, VectorSimilarityFunction.EUCLIDEAN
+        }) {
+      try (Directory dir = newDirectory();
+          IndexWriter writer = new IndexWriter(dir, config(FineTier.FP32, 8, false))) {
+        List<float[]> vectors = new ArrayList<>();
+        for (int i = 0; i < 50; i++) {
+          float[] vector = VectorUtil.l2normalize(randomVector());
+          vectors.add(vector);
+          Document doc = new Document();
+          doc.add(new KnnFloatVectorField("v", vector, similarity));
+          doc.add(new NumericDocValuesField("id", i));
+          writer.addDocument(doc);
+        }
+        writer.forceMerge(1);
+        try (DirectoryReader reader = DirectoryReader.open(writer)) {
+          LeafReader leaf = getOnlyLeafReader(reader);
+          float[] target = randomVector();
+          var scorer = leaf.getFloatVectorValues("v").scorer(target);
+          var ids = leaf.getNumericDocValues("id");
+          DocIdSetIterator it = scorer.iterator();
+          for (int doc = it.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = it.nextDoc()) {
+            assertTrue(ids.advanceExact(doc));
+            float[] vector = vectors.get((int) ids.longValue());
+            assertEquals(similarity.compare(target, vector), scorer.score(), 1e-4f);
+          }
+        }
+      }
+    }
+  }
+
+  public void testDirectFineReadsMatchMappedReads() throws Exception {
+    try (Directory dir = newFSDirectory(createTempDir())) {
+      // One flushed, non-compound segment, so the data file can be opened directly.
+      IndexWriterConfig config =
+          config(FineTier.INT8, 8, false)
+              .setUseCompoundFile(false)
+              .setMergePolicy(NoMergePolicy.INSTANCE)
+              .setMaxBufferedDocs(10_000)
+              .setRAMBufferSizeMB(256);
+      try (IndexWriter writer = new IndexWriter(dir, config)) {
+        for (int i = 0; i < 2000; i++) {
+          Document doc = new Document();
+          doc.add(new KnnFloatVectorField("v", randomVector(), VectorSimilarityFunction.COSINE));
+          writer.addDocument(doc);
+        }
+      }
+      float[] target = randomVector();
+      var mapped = search(dir, target);
+      String previous = System.getProperty(IVFasterEvoVectorsReader.URING_FINE_PROPERTY);
+      System.setProperty(IVFasterEvoVectorsReader.URING_FINE_PROPERTY, "true");
+      try {
+        try (DirectoryReader reader = DirectoryReader.open(dir)) {
+          var codecReader = (CodecReader) getOnlyLeafReader(reader);
+          var evo =
+              (IVFasterEvoVectorsReader) codecReader.getVectorReader().unwrapReaderForField("v");
+          assumeTrue("io_uring is unavailable here", evo.readsFineDirectly());
+        }
+        var direct = search(dir, target);
+        assertEquals(mapped.length, direct.length);
+        for (int i = 0; i < mapped.length; i++) {
+          assertEquals(mapped[i].doc, direct[i].doc);
+          assertEquals(mapped[i].score, direct[i].score, 0f);
+        }
+      } finally {
+        if (previous == null) System.clearProperty(IVFasterEvoVectorsReader.URING_FINE_PROPERTY);
+        else System.setProperty(IVFasterEvoVectorsReader.URING_FINE_PROPERTY, previous);
+      }
+    }
+  }
+
+  private static ScoreDoc[] search(Directory dir, float[] target) throws Exception {
+    try (DirectoryReader reader = DirectoryReader.open(dir)) {
+      TopKnnCollector collector =
+          new TopKnnCollector(
+              10, Integer.MAX_VALUE, new IVFasterEvoVectorsFormat.SearchStrategy(8));
+      getOnlyLeafReader(reader).searchNearestVectors("v", target, collector, null);
+      return collector.topDocs().scoreDocs;
+    }
+  }
+
   public void testProbeMarginMustBeANumberInRange() {
     for (float margin : new float[] {Float.NaN, 0f, -1f, 1.5f}) {
       expectThrows(
@@ -179,6 +265,7 @@ public class TestIVFasterEvoVectorsFormat extends LuceneTestCase {
     float[] target = randomVector();
     VectorUtil.l2normalize(target);
     var values = reader.getFloatVectorValues(field);
+    if (values == null) return; // a small random segment may hold no vectors for this field
     Bits live = reader.getLiveDocs();
     List<float[]> expected = new ArrayList<>(); // {doc, score}
     var iterator = values.iterator();

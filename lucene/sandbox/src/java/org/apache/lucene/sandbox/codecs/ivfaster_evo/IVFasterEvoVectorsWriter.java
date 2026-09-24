@@ -110,23 +110,39 @@ final class IVFasterEvoVectorsWriter extends KnnVectorsWriter {
     return field;
   }
 
+  /**
+   * Returns whether every non-IVFasterEvo source can be copied per staging worker; a source that
+   * cannot (e.g. a sorting view) forces staging onto the merge thread.
+   */
+  private static boolean copyable(FloatVectorValues[] vals, Field[] views) throws IOException {
+    for (int r = 0; r < vals.length; r++) {
+      if (views[r] != null || vals[r] == null) continue;
+      try {
+        vals[r].copy();
+      } catch (UnsupportedOperationException _) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   /** Sorts, stages, clusters, and writes all buffered fields. */
   @Override
   public void flush(int maxDoc, Sorter.DocMap sortMap) throws IOException {
     for (BufferedField field : fields) {
       int count = field.size, dim = field.info.getVectorDimension();
       float[][] vectors = field.vectors;
+      var si = state.segmentInfo;
       long[] keys = new long[count];
       for (int i = 0; i < count; i++) {
         int doc = sortMap == null ? field.docIds[i] : sortMap.oldToNew(field.docIds[i]);
         keys[i] = (long) doc << 32 | i;
       }
       Arrays.sort(keys);
-      var si = state.segmentInfo;
       try (var staged = new StagedVectors(state, new FineCodec(format.fineTier, dim), 0)) {
         for (int start = 0, n; start < count; start += n) {
           n = Math.min(StagedVectors.CHUNK_ORDS, count - start);
-          staged.add(start, n, k -> (int) (keys[k] >>> 32), (k, _) -> vectors[(int) keys[k]]);
+          staged.add(start, n, k -> (int) (keys[k] >>> 32), (k, _) -> vectors[(int) keys[k]], true);
           for (int k = start; k < start + n; k++) vectors[(int) keys[k]] = null;
         }
         HotStart.Seed hs = HotStart.seed(si.dir, si.name, field.info, format.nlist, count);
@@ -193,7 +209,25 @@ final class IVFasterEvoVectorsWriter extends KnnVectorsWriter {
     HotStart.Seed donorSnapshot = donor < 0 ? null : snapshots[donor];
     int[] cells = new int[0], cell2 = new int[0];
     float[] d1 = new float[0], d2 = new float[0];
-    int[][] seedMembers = new int[readers][];
+    // Per reader: primary-cell populations (non-null iff its rows carry the donor's cells), plus
+    // same-lineage published primary/secondary assignments.
+    int[][] seedMembers = new int[readers][], primary = new int[readers][];
+    int[][] secondary = new int[readers][];
+    for (int r = 0; from != null && r < readers; r++) {
+      HotStart.Seed snapshot = snapshots[r];
+      boolean sameLineage =
+          snapshot != null
+              && donorSnapshot != null
+              && snapshot.lineage().equals(donorSnapshot.lineage())
+              && views[r].nlist == from.nlist;
+      if (sameLineage == false && r != donor) continue;
+      seedMembers[r] = new int[from.nlist];
+      if (sameLineage == false) continue;
+      int[] assignment = snapshot.assignment();
+      if (assignment != null && assignment.length == views[r].count) primary[r] = assignment;
+      secondary[r] = snapshot.cell2();
+    }
+    boolean parallel = copyable(vals, views);
     try (var staged = new StagedVectors(state, new FineCodec(format.fineTier, dim), readers)) {
       int max = StagedVectors.CHUNK_ORDS;
       int[] srcs = new int[max], ords = new int[max], docs = new int[max];
@@ -201,10 +235,11 @@ final class IVFasterEvoVectorsWriter extends KnnVectorsWriter {
           (j, local) -> {
             int r = srcs[j];
             if (views[r] != null) {
-              views[r].copyRow(ords[j], docs[j], staged.chunk, j * staged.stride);
+              if (local[r] == null) local[r] = views[r].new Values();
+              ((Field.Values) local[r]).copyRow(ords[j], docs[j], staged.chunk, j * staged.stride);
               return null;
             }
-            if (local[r] == null) local[r] = vals[r].copy();
+            if (local[r] == null) local[r] = parallel ? vals[r].copy() : vals[r];
             return local[r].vectorValue(ords[j]);
           };
       for (int n = max; n == max; ) {
@@ -215,45 +250,25 @@ final class IVFasterEvoVectorsWriter extends KnnVectorsWriter {
           ords[n] = sub.iterator.index();
           docs[n] = sub.mappedDocID;
         }
-        staged.add(0, n, j -> docs[j], rows);
+        staged.add(0, n, j -> docs[j], rows, parallel);
         if (from == null) continue;
         cells = ArrayUtil.grow(cells, at + n);
         cell2 = ArrayUtil.grow(cell2, at + n);
         d1 = ArrayUtil.grow(d1, at + n);
         d2 = ArrayUtil.grow(d2, at + n);
-        for (int j = 0; j < n; j++) {
+        for (int j = 0; j < n; j++, at++) {
           int r = srcs[j], ord = ords[j];
-          HotStart.Seed snapshot = snapshots[r];
-          boolean sameLineage =
-              snapshot != null
-                  && donorSnapshot != null
-                  && snapshot.lineage().equals(donorSnapshot.lineage())
-                  && views[r].nlist == from.nlist;
-          if (sameLineage) {
-            int cell =
-                snapshot.assignment() != null
-                        && snapshot.assignment().length == views[r].count
-                        && ord < snapshot.assignment().length
-                    ? snapshot.assignment()[ord]
-                    : views[r].cellOf(ord);
-            cells[at] = cell;
-            cell2[at] =
-                snapshot.cell2() != null && ord < snapshot.cell2().length
-                    ? snapshot.cell2()[ord]
-                    : -1;
-            d1[at] = d2[at] = Float.NaN;
-            if (seedMembers[r] == null) seedMembers[r] = new int[from.nlist];
-            seedMembers[r][cell]++;
-          } else {
-            cells[at] = r == donor ? from.cellOf(ord) : -1;
-            cell2[at] = -1;
-            d1[at] = d2[at] = r == donor ? Float.NaN : Float.MAX_VALUE;
-            if (r == donor) {
-              if (seedMembers[r] == null) seedMembers[r] = new int[from.nlist];
-              seedMembers[r][cells[at]]++;
-            }
+          if (seedMembers[r] == null) {
+            cells[at] = cell2[at] = -1;
+            d1[at] = d2[at] = Float.MAX_VALUE;
+            continue;
           }
-          at++;
+          int[] first = primary[r], second = secondary[r];
+          int cell = first != null && ord < first.length ? first[ord] : views[r].cellOf(ord);
+          cells[at] = cell;
+          cell2[at] = second != null && ord < second.length ? second[ord] : -1;
+          d1[at] = d2[at] = Float.NaN;
+          seedMembers[r][cell]++;
         }
       }
       float[][] seed = from == null ? null : weightedSeed(views, snapshots, seedMembers, donor);
@@ -277,21 +292,14 @@ final class IVFasterEvoVectorsWriter extends KnnVectorsWriter {
 
   /** Averages corresponding same-lineage centroids by their live primary-cell populations. */
   private static float[][] weightedSeed(
-      Field[] views,
-      HotStart.Seed[] snapshots,
-      int[][] members,
-      int donor) {
+      Field[] views, HotStart.Seed[] snapshots, int[][] members, int donor) {
     float[][][] centroids = new float[views.length][][];
     String[] lineages = new String[views.length];
-    HotStart.Seed donorSnapshot = snapshots[donor];
     for (int r = 0; r < views.length; r++) {
-      HotStart.Seed snapshot = snapshots[r];
       if (views[r] != null) centroids[r] = views[r].centroids;
-      if (snapshot != null) lineages[r] = snapshot.lineage();
+      if (snapshots[r] != null) lineages[r] = snapshots[r].lineage();
     }
-    if (lineages[donor] == null) {
-      lineages[donor] = donorSnapshot == null ? "" : donorSnapshot.lineage();
-    }
+    if (lineages[donor] == null) lineages[donor] = "";
     return HotStart.weightedCentroids(centroids, members, lineages, donor);
   }
 
@@ -313,7 +321,7 @@ final class IVFasterEvoVectorsWriter extends KnnVectorsWriter {
     meta.writeVInt(format.nprobe);
     meta.writeVInt(format.spillBits);
     if (nlist == 0) {
-      for (int s = 0; s < 6; s++) meta.writeVLong(data.getFilePointer());
+      for (int s = 0; s < 7; s++) meta.writeVLong(data.getFilePointer());
       return;
     }
     Clustering.Result cl = Clustering.cluster(staged, nlist, seed, warm, format.spillBits);
@@ -324,6 +332,7 @@ final class IVFasterEvoVectorsWriter extends KnnVectorsWriter {
     }
     for (int c = 0; c < nlist; c++) cellStart[c + 1] += cellStart[c];
     int[] slotRow = new int[cellStart[nlist]], primarySlot = new int[count];
+    int[] slotDoc = new int[slotRow.length];
     int[] next = ArrayUtil.copyOfSubArray(cellStart, 0, nlist);
     for (int i = 0; i < count; i++) {
       for (int k = 0, n = cl.cellCount(i); k < n; k++) {
@@ -337,7 +346,8 @@ final class IVFasterEvoVectorsWriter extends KnnVectorsWriter {
       for (float v : centroid) data.writeInt(Float.floatToIntBits(v));
     }
     byte[] row = new byte[staged.recordLen];
-    int stride = staged.stride, primaryOffset = CodeRecord.primaryCellOffset(staged.fine.codeBytes);
+    int stride = staged.stride, docIdOffset = staged.fine.codeBytes;
+    int primaryOffset = CodeRecord.primaryCellOffset(docIdOffset);
     for (int pass = 0; pass < 2; pass++) {
       int from = pass * staged.recordLen, len = pass == 0 ? staged.recordLen : staged.coarseBytes;
       meta.writeVLong(data.getFilePointer());
@@ -347,7 +357,10 @@ final class IVFasterEvoVectorsWriter extends KnnVectorsWriter {
           for (int p = slot; p < end; p++) rows.prefetch((long) slotRow[p] * stride, stride);
         }
         rows.readBytes((long) slotRow[slot] * stride + from, row, 0, len);
-        if (pass == 0) BitUtil.VH_LE_INT.set(row, primaryOffset, cl.cell(slotRow[slot], 0));
+        if (pass == 0) {
+          BitUtil.VH_LE_INT.set(row, primaryOffset, cl.cell(slotRow[slot], 0));
+          slotDoc[slot] = (int) BitUtil.VH_LE_INT.get(row, docIdOffset);
+        }
         data.writeBytes(row, 0, len);
       }
     }
@@ -357,6 +370,8 @@ final class IVFasterEvoVectorsWriter extends KnnVectorsWriter {
     }
     meta.writeVLong(data.getFilePointer());
     for (int slot : primarySlot) data.writeInt(slot);
+    meta.writeVLong(data.getFilePointer());
+    for (int doc : slotDoc) data.writeInt(doc);
     meta.writeVLong(data.getFilePointer());
     var w = DirectMonotonicWriter.getInstance(meta, data, nlist + 1, DIRECT_MONOTONIC_BLOCK_SHIFT);
     for (int start : cellStart) w.add((long) start * Integer.BYTES);
@@ -440,6 +455,7 @@ final class IVFasterEvoVectorsWriter extends KnnVectorsWriter {
 
     final FineCodec fine;
     final int dim, recordLen, coarseBytes, stride;
+    private final HadamardRotation rotation;
     private final SegmentWriteState state;
     private final String name;
     private final int readers;
@@ -457,17 +473,17 @@ final class IVFasterEvoVectorsWriter extends KnnVectorsWriter {
       recordLen = CodeRecord.length(fine.codeBytes);
       coarseBytes = Nitrox2.bytesPerVector(dim);
       stride = recordLen + coarseBytes;
+      rotation = HadamardRotation.create(dim, rotationSeed(dim));
       out = state.directory.createTempOutput(state.segmentInfo.name, "ivfstage", state.context);
       name = out.getName();
     }
 
     /** Encodes and appends a chunk of source rows. */
-    void add(int base, int n, IntUnaryOperator docs, Rows source) throws IOException {
+    void add(int base, int n, IntUnaryOperator docs, Rows source, boolean parallel)
+        throws IOException {
       if (chunk == null) chunk = new byte[n * stride];
-      int docIdOffset = fine.codeBytes;
-      HadamardRotation rotation = HadamardRotation.create(dim, rotationSeed(dim));
-      Parallel.overRange(
-          n,
+      int docIdOffset = fine.codeBytes, primaryOffset = CodeRecord.primaryCellOffset(docIdOffset);
+      Parallel.RangeTask encode =
           (lo, hi) -> {
             FloatVectorValues[] local = new FloatVectorValues[readers];
             float[] unit = new float[dim], rotated = new float[dim];
@@ -480,10 +496,12 @@ final class IVFasterEvoVectorsWriter extends KnnVectorsWriter {
               rotation.rotate(unit, rotated);
               fine.encode(rotated, chunk, at);
               BitUtil.VH_LE_INT.set(chunk, at + docIdOffset, docs.applyAsInt(base + j));
-              BitUtil.VH_LE_INT.set(chunk, at + CodeRecord.primaryCellOffset(fine.codeBytes), 0);
+              BitUtil.VH_LE_INT.set(chunk, at + primaryOffset, 0);
               Nitrox2.encode(rotated, dim, chunk, at + recordLen);
             }
-          });
+          };
+      if (parallel) Parallel.overRange(n, encode);
+      else encode.run(0, n);
       out.writeBytes(chunk, 0, n * stride);
       count += n;
     }

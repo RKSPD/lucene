@@ -19,6 +19,7 @@ package org.apache.lucene.sandbox.codecs.ivfaster_evo;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
 import java.util.Arrays;
 import java.util.Random;
 import org.apache.lucene.index.VectorSimilarityFunction;
@@ -35,37 +36,46 @@ final class Tiers {
 
     final FineTier tier;
     final int dim, codeBytes;
+    private final int scaleOffset;
 
     /** Configures the fine vector encoding for a dimension. */
     FineCodec(FineTier tier, int dim) {
       this.tier = tier;
       this.dim = dim;
       codeBytes = tier == FineTier.FP32 ? dim * Float.BYTES : dim;
+      scaleOffset = CodeRecord.scaleOffset(codeBytes);
     }
 
     /** Encodes a rotated vector into its fine-tier record. */
     void encode(float[] rotated, byte[] record, int offset) {
       if (tier == FineTier.FP32) {
-        var bytes = ByteBuffer.wrap(record, offset, codeBytes).order(ByteOrder.LITTLE_ENDIAN);
-        bytes.asFloatBuffer().put(rotated, 0, dim);
+        floats(record, offset).put(rotated, 0, dim);
         return;
       }
       float scale = quantize(rotated, record, offset);
-      BitUtil.VH_LE_INT.set(
-          record, offset + CodeRecord.scaleOffset(codeBytes), Float.floatToIntBits(scale));
+      BitUtil.VH_LE_INT.set(record, offset + scaleOffset, Float.floatToIntBits(scale));
     }
 
     /** Decodes a fine-tier record back into a rotated vector. */
     void decode(byte[] record, int offset, float[] dest) {
       if (tier == FineTier.FP32) {
-        var bytes = ByteBuffer.wrap(record, offset, codeBytes).order(ByteOrder.LITTLE_ENDIAN);
-        bytes.asFloatBuffer().get(dest, 0, dim);
+        floats(record, offset).get(dest, 0, dim);
         return;
       }
-      float scale =
-          Float.intBitsToFloat(
-              (int) BitUtil.VH_LE_INT.get(record, offset + CodeRecord.scaleOffset(codeBytes)));
+      float scale = scale(record, offset);
       for (int d = 0; d < dim; d++) dest[d] = scale * record[offset + d];
+    }
+
+    /** Returns a little-endian float view of the FP32 code starting at {@code offset}. */
+    private FloatBuffer floats(byte[] record, int offset) {
+      return ByteBuffer.wrap(record, offset, codeBytes)
+          .order(ByteOrder.LITTLE_ENDIAN)
+          .asFloatBuffer();
+    }
+
+    /** Reads the INT8 quantization scale stored in the record at {@code offset}. */
+    private float scale(byte[] record, int offset) {
+      return Float.intBitsToFloat((int) BitUtil.VH_LE_INT.get(record, offset + scaleOffset));
     }
 
     /** Prepares a reusable scorer for one rotated query vector. */
@@ -73,10 +83,11 @@ final class Tiers {
       return new Query(rotated, similarity);
     }
 
+    /** Per-query scorer over batches of fine-tier records. */
     final class Query {
       private final VectorSimilarityFunction similarity;
-      private final float[] query, decoded = new float[dim];
-      private final byte[] levels = new byte[dim];
+      private final float[] query, decoded;
+      private final byte[] levels;
       private final float queryScale;
       private int[] dots = new int[0];
 
@@ -84,27 +95,33 @@ final class Tiers {
       private Query(float[] rotated, VectorSimilarityFunction similarity) {
         this.similarity = similarity;
         query = rotated.clone();
-        queryScale = tier == FineTier.INT8 ? quantize(query, levels, 0) : 1f;
+        if (tier == FineTier.INT8) {
+          decoded = null;
+          levels = new byte[dim];
+          queryScale = quantize(query, levels, 0);
+        } else {
+          decoded = new float[dim];
+          levels = null;
+          queryScale = 1f;
+        }
       }
 
       /** Scores a batch of encoded fine-tier records. */
       void score(byte[] records, int stride, int count, float[] scores) {
-        if (tier == FineTier.INT8) {
-          dots = ArrayUtil.growNoCopy(dots, count);
-          K.dotProducts(levels, records, stride, count, dots);
-        }
-        for (int r = 0; r < count; r++) {
-          if (tier == FineTier.FP32) {
-            decode(records, r * stride, decoded);
+        if (tier == FineTier.FP32) {
+          // One view per batch; records start at multiples of stride (a cache-line multiple).
+          assert stride % Float.BYTES == 0;
+          FloatBuffer all = ByteBuffer.wrap(records).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer();
+          for (int r = 0; r < count; r++) {
+            all.get(r * stride / Float.BYTES, decoded, 0, dim);
             scores[r] = finish(VectorUtil.dotProduct(query, decoded));
-          } else {
-            float docScale =
-                Float.intBitsToFloat(
-                    (int)
-                        BitUtil.VH_LE_INT.get(
-                            records, r * stride + CodeRecord.scaleOffset(codeBytes)));
-            scores[r] = finish((double) queryScale * docScale * dots[r]);
           }
+          return;
+        }
+        dots = ArrayUtil.growNoCopy(dots, count);
+        K.dotProducts(levels, records, stride, count, dots);
+        for (int r = 0; r < count; r++) {
+          scores[r] = finish((double) queryScale * scale(records, r * stride) * dots[r]);
         }
       }
 
@@ -162,6 +179,7 @@ final class Tiers {
     }
   }
 
+  /** Byte layout of one fine record: code, doc id, primary cell, scale, padded to 64 bytes. */
   static final class CodeRecord {
     /** Aligns a fine-code record and its metadata to a cache line. */
     static int length(int codeBytes) {
@@ -221,7 +239,8 @@ final class Tiers {
               a[p] = x + y;
               a[p + h] = x - y;
             }
-        for (int i = offset; i < offset + len; i++) a[i] *= (float) (1.0 / Math.sqrt(len));
+        float norm = (float) (1.0 / Math.sqrt(len));
+        for (int i = offset; i < offset + len; i++) a[i] *= norm;
         offset += len;
       }
     }

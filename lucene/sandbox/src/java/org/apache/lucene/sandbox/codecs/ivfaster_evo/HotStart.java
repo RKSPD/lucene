@@ -37,8 +37,8 @@ import org.apache.lucene.store.Directory;
  * Retains recent centroid state so later segments can warm-start clustering.
  *
  * <p>Flushes and merges create different physical parts of the same index. Reusing compatible
- * centroids, assignments, and distance bounds keeps that earlier clustering work from being
- * discarded and reduces repeated indexing cost.
+ * centroids and assignments keeps that earlier clustering work from being discarded and reduces
+ * repeated indexing cost.
  */
 final class HotStart {
   private static final Map<Directory, Map<String, List<Seed>>> INDEXES = new WeakHashMap<>();
@@ -51,9 +51,7 @@ final class HotStart {
       float[][] centroids,
       int[] members,
       int[] assignment,
-      int[] cell2,
-      float[] d1,
-      float[] d2) {}
+      int[] cell2) {}
 
   /** Builds the cache key for a vector field configuration. */
   private static String key(FieldInfo info) {
@@ -73,28 +71,39 @@ final class HotStart {
       FieldInfo info,
       Clustering.Result result,
       int vectors) {
+    put(
+        dir,
+        segment,
+        lineage,
+        info,
+        vectors,
+        result.centroids(),
+        result.assignment(),
+        result.cell2());
+  }
+
+  /** Replaces a segment's cached state, keeping each field's seeds sorted largest first. */
+  private static void put(
+      Directory dir,
+      String segment,
+      String lineage,
+      FieldInfo info,
+      int vectors,
+      float[][] centroids,
+      int[] assignment,
+      int[] cell2) {
     var fields = INDEXES.computeIfAbsent(dir, _ -> new HashMap<>());
     List<Seed> seeds = fields.computeIfAbsent(key(info), _ -> new ArrayList<>());
     seeds.removeIf(seed -> seed.segment.equals(segment));
-    seeds.add(
-        new Seed(
-            segment,
-            lineage,
-            vectors,
-            result.centroids(),
-            primaryMembers(result.assignment(), result.centroids().length),
-            result.assignment(),
-            result.cell2(),
-            result.d1(),
-            result.d2()));
+    int[] members = primaryMembers(assignment, centroids.length);
+    seeds.add(new Seed(segment, lineage, vectors, centroids, members, assignment, cell2));
     seeds.sort(Comparator.comparingInt(Seed::vectors).reversed());
   }
 
   /** Returns the cached state for a specific segment. */
   static synchronized Seed snapshot(Directory dir, String segment, FieldInfo info) {
     Map<String, List<Seed>> fields = INDEXES.get(dir);
-    if (fields == null) return null;
-    List<Seed> seeds = fields.get(key(info));
+    List<Seed> seeds = fields == null ? null : fields.get(key(info));
     if (seeds == null) return null;
     for (Seed seed : seeds) if (seed.segment.equals(segment)) return seed;
     return null;
@@ -109,36 +118,24 @@ final class HotStart {
     Set<String> live = new HashSet<>();
     for (String file : dir.listAll()) live.add(IndexFileNames.parseSegmentName(file));
     seeds.removeIf(s -> s.segment.equals(writing) || live.contains(s.segment) == false);
-    Seed donor = null;
-    for (Seed candidate : seeds) {
-      int cells = candidate.centroids.length;
-      if (cells <= nlist && cells >= Math.max(1, nlist / 2) && cells <= count) {
-        donor = candidate;
-        break;
-      }
+    int n = seeds.size(), donor = -1;
+    for (int i = 0; i < n && donor < 0; i++) {
+      int cells = seeds.get(i).centroids.length;
+      if (cells <= nlist && cells >= Math.max(1, nlist / 2) && cells <= count) donor = i;
     }
-    if (donor == null) return null;
-    float[][][] centroids = new float[seeds.size()][][];
-    int[][] members = new int[seeds.size()][];
-    String[] lineages = new String[seeds.size()];
-    int donorIndex = -1;
-    for (int i = 0; i < seeds.size(); i++) {
+    if (donor < 0) return null;
+    float[][][] centroids = new float[n][][];
+    int[][] members = new int[n][];
+    String[] lineages = new String[n];
+    for (int i = 0; i < n; i++) {
       Seed candidate = seeds.get(i);
       centroids[i] = candidate.centroids;
       members[i] = candidate.members;
       lineages[i] = candidate.lineage;
-      if (candidate == donor) donorIndex = i;
     }
-    return new Seed(
-        donor.segment,
-        donor.lineage,
-        donor.vectors,
-        weightedCentroids(centroids, members, lineages, donorIndex),
-        null,
-        null,
-        null,
-        null,
-        null);
+    Seed d = seeds.get(donor);
+    float[][] weighted = weightedCentroids(centroids, members, lineages, donor);
+    return new Seed(d.segment, d.lineage, d.vectors, weighted, null, null, null);
   }
 
   /** Counts primary assignments for weighting corresponding centroids. */
@@ -207,11 +204,8 @@ final class HotStart {
                     == IVFasterEvoVectorsWriter.rotationSeed(info.getVectorDimension())) {
               int[] assignment = new int[view.count];
               for (int ord = 0; ord < view.count; ord++) assignment[ord] = view.cellOf(ord);
-              var empty =
-                  new Clustering.Result(
-                      view.centroids, new int[0], 0, assignment, null, null, null);
               String segment = sr.getSegmentInfo().info.name;
-              publish(dir, segment, segment, info, empty, view.count);
+              put(dir, segment, segment, info, view.count, view.centroids, assignment, null);
             }
           }
         }

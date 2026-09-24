@@ -23,10 +23,12 @@ import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
 import static org.apache.lucene.util.packed.DirectMonotonicReader.loadMeta;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.foreign.MemorySegment;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.index.ByteVectorValues;
@@ -49,6 +51,8 @@ import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.store.ChecksumIndexInput;
+import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.store.FilterDirectory;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.MemorySegmentAccessInput;
 import org.apache.lucene.store.RandomAccessInput;
@@ -58,6 +62,7 @@ import org.apache.lucene.util.BitUtil;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.NumericUtils;
+import org.apache.lucene.util.SuppressForbidden;
 import org.apache.lucene.util.VectorUtil;
 import org.apache.lucene.util.packed.DirectMonotonicReader;
 
@@ -74,21 +79,27 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
   private static final int DEDUP_MASK = (Integer.highestOneBit(SHORTLIST) << 2) - 1;
   private static final Kernels K = Kernels.INSTANCE;
   private static final boolean REPORT_ENGAGEMENT = Boolean.getBoolean("ivfaster.reportEngagement");
-  private static final java.util.concurrent.atomic.AtomicLong SCAN_QUERIES =
-      new java.util.concurrent.atomic.AtomicLong();
-  private static final java.util.concurrent.atomic.AtomicLong SCANNED_SLOTS =
-      new java.util.concurrent.atomic.AtomicLong();
-  private static final java.util.concurrent.atomic.AtomicLong PROBED_CELLS =
-      new java.util.concurrent.atomic.AtomicLong();
+
+  /**
+   * Opt-in: read fine records with io_uring O_DIRECT so they never displace cached coarse codes.
+   */
+  static final String URING_FINE_PROPERTY = "ivfaster.evo.uringFine";
+
+  private static final AtomicLong SCAN_QUERIES = new AtomicLong(),
+      SCANNED_SLOTS = new AtomicLong(),
+      PROBED_CELLS = new AtomicLong();
 
   private final Map<String, Field> fields = new HashMap<>();
   private final IndexInput data;
+  private final UringDirectReader uring;
   private final String segment;
+  private final int segmentMaxDoc;
 
   /** Opens IVFasterEvo metadata and data for one segment. */
   IVFasterEvoVectorsReader(SegmentReadState state) throws IOException {
     String name = state.segmentInfo.name, sfx = state.segmentSuffix;
     segment = name;
+    segmentMaxDoc = state.segmentInfo.maxDoc();
     byte[] id = state.segmentInfo.getId();
     int version = -1;
     String metaName = IndexFileNames.segmentFileName(name, sfx, META_EXTENSION);
@@ -99,7 +110,7 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
         for (int number = meta.readInt(); number != -1; number = meta.readInt()) {
           FieldInfo info = state.fieldInfos.fieldInfo(number);
           if (info == null) throw new CorruptIndexException("invalid field number " + number, meta);
-          fields.put(info.name, new Field(meta, info));
+          fields.put(info.name, new Field(meta, info, version));
         }
       } catch (Throwable t) {
         prior = t;
@@ -117,6 +128,23 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
       IOUtils.closeWhileSuppressingExceptions(t, data);
       throw t;
     }
+    uring = openUring(state, dataName, version);
+  }
+
+  /**
+   * Opens direct fine-record reads when requested and possible: a v2 index (so deduplication never
+   * touches a fine record) in its own file of a file-system directory, on a kernel with io_uring.
+   */
+  private static UringDirectReader openUring(SegmentReadState state, String name, int version) {
+    if (Boolean.getBoolean(URING_FINE_PROPERTY) == false || version < VERSION_SLOT_DOC) return null;
+    if (FilterDirectory.unwrap(state.directory) instanceof FSDirectory fs) {
+      try {
+        return UringDirectReader.open(fs.getDirectory().resolve(name));
+      } catch (IOException _) {
+        // fine records are read through the mapped input instead
+      }
+    }
+    return null;
   }
 
   final class Field {
@@ -124,30 +152,31 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
     final FineTier fineTier;
     final int dim, nlist, count, nprobe, spillBits, recordLen, coarseBytes, docIdOffset;
     final long rotationSeed;
-    final long[] sections = new long[6];
+    final long[] sections;
     final DirectMonotonicReader.Meta postingOffsets;
     final HadamardRotation rotation;
     final FineCodec fine;
 
-    RandomAccessInput records, coarse;
+    RandomAccessInput records, coarse, slotDocs;
     MemorySegmentAccessInput coarseAccess;
     MemorySegment coarseSeg;
-    int[] cellStart, ordToSlot, ordToDoc, slotDoc, allCells, primaryCells;
+    int[] cellStart, ordToSlot, ordToDoc, allCells, primaryCells;
     float[][] centroids;
     private volatile CentroidCodes codes;
     CentroidGraph graph;
 
     /** Reads immutable metadata for one vector field. */
-    Field(ChecksumIndexInput meta, FieldInfo info) throws IOException {
+    Field(ChecksumIndexInput meta, FieldInfo info, int version) throws IOException {
       similarity = info.getVectorSimilarityFunction();
-      int tier = meta.readByte();
-      fineTier = FineTier.values()[tier];
+      fineTier = FineTier.values()[meta.readByte()];
       dim = meta.readVInt();
       nlist = meta.readVInt();
       count = meta.readVInt();
       rotationSeed = meta.readLong();
       nprobe = meta.readVInt();
       spillBits = meta.readVInt();
+      // Sections: centroids, records, coarse, graph, ordToSlot, [slotDoc,] posting offsets.
+      sections = new long[version >= VERSION_SLOT_DOC ? 7 : 6];
       for (int s = 0; s < sections.length; s++) sections[s] = meta.readVLong();
       postingOffsets = nlist == 0 ? null : loadMeta(meta, nlist + 1, DIRECT_MONOTONIC_BLOCK_SHIFT);
       if (dim != info.getVectorDimension()) throw new CorruptIndexException("dimension", meta);
@@ -163,7 +192,7 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
       return data.randomAccessSlice(sections[s], sections[s + 1] - sections[s]);
     }
 
-    /** Lazily loads postings, records, document mappings, and centroids. */
+    /** Lazily loads postings, record slices, and centroids needed by every search. */
     synchronized Field open() throws IOException {
       if (records != null) return this;
       coarse = section(2);
@@ -173,26 +202,45 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
       }
       cellStart = new int[nlist + 1];
       if (nlist > 0) {
-        RandomAccessInput tail = data.randomAccessSlice(sections[5], data.length() - sections[5]);
+        long postings = sections[sections.length - 1];
+        RandomAccessInput tail = data.randomAccessSlice(postings, data.length() - postings);
         var offsets = DirectMonotonicReader.getInstance(postingOffsets, tail);
         for (int c = 0; c <= nlist; c++) cellStart[c] = (int) (offsets.get(c) / Integer.BYTES);
       }
       RandomAccessInput recs = section(1);
-      slotDoc = new int[cellStart[nlist]];
-      for (int slot = 0; slot < slotDoc.length; slot++) {
-        slotDoc[slot] = recs.readInt((long) slot * recordLen + docIdOffset);
-      }
+      if (sections.length == 7) slotDocs = section(5);
       IndexInput all = data.clone();
-      ordToSlot = new int[count];
-      ordToDoc = new int[count];
-      all.seek(sections[4]);
-      all.readInts(ordToSlot, 0, count);
-      for (int ord = 0; ord < count; ord++) ordToDoc[ord] = slotDoc[ordToSlot[ord]];
       centroids = new float[nlist][dim];
       all.seek(sections[0]);
       for (float[] centroid : centroids) all.readFloats(centroid, 0, dim);
       records = recs;
       return this;
+    }
+
+    /** Reads one slot's document ID, from the slot-to-document section when the index has one. */
+    private int docAt(int slot) throws IOException {
+      return slotDocs != null
+          ? slotDocs.readInt((long) slot * Integer.BYTES)
+          : records.readInt((long) slot * recordLen + docIdOffset);
+    }
+
+    /** Lazily loads the compact ordinal-to-primary-slot table. */
+    private synchronized void loadOrdToSlot() throws IOException {
+      if (ordToSlot != null) return;
+      int[] slots = new int[count];
+      IndexInput all = data.clone();
+      all.seek(sections[4]);
+      all.readInts(slots, 0, count);
+      ordToSlot = slots;
+    }
+
+    /** Lazily loads document IDs needed by vector values and sparse-vector filter lookup. */
+    private synchronized void loadOrdinalMappings() throws IOException {
+      if (ordToDoc != null) return;
+      loadOrdToSlot();
+      int[] docs = new int[count];
+      for (int ord = 0; ord < count; ord++) docs[ord] = docAt(ordToSlot[ord]);
+      ordToDoc = docs;
     }
 
     /** Returns a mapped slice when one mmap chunk covers the requested range. */
@@ -205,12 +253,20 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
       }
     }
 
-    /** Returns a mapping rebased to one cell run when the whole coarse section is not mappable. */
+    /**
+     * Returns the mapping holding one cell run: the whole coarse section when mappable, otherwise a
+     * slice rebased to the run, or null when neither is mapped. Offsets start at {@code runBase}.
+     */
     private MemorySegment coarseRun(int slotBase, int rows) {
+      if (coarseSeg != null) return coarseSeg;
       return coarseAccess == null
           ? null
-          : segmentOrNull(
-              coarseAccess, (long) slotBase * coarseBytes, (long) rows * coarseBytes);
+          : segmentOrNull(coarseAccess, (long) slotBase * coarseBytes, (long) rows * coarseBytes);
+    }
+
+    /** Returns the byte offset of slot {@code slotBase} within its {@code coarseRun} mapping. */
+    private long runBase(int slotBase) {
+      return coarseSeg == null ? 0 : (long) slotBase * coarseBytes;
     }
 
     /** Lazily builds centroid codes and loads the navigation graph. */
@@ -225,6 +281,7 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
 
     /** Returns the persisted primary cell for one vector ordinal. */
     synchronized int cellOf(int ord) throws IOException {
+      loadOrdToSlot();
       if (primaryCells == null) {
         primaryCells = new int[count];
         for (int o = 0; o < count; o++) {
@@ -234,16 +291,14 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
       return primaryCells[ord];
     }
 
-    /** Copies a staged row while replacing merge-specific metadata. */
-    void copyRow(int ord, int docId, byte[] dest, int offset) throws IOException {
-      records.readBytes((long) ordToSlot[ord] * recordLen, dest, offset, recordLen);
-      BitUtil.VH_LE_INT.set(dest, offset + docIdOffset, docId);
-      BitUtil.VH_LE_INT.set(dest, offset + docIdOffset + 4, 0);
-      coarse.readBytes((long) ordToSlot[ord] * coarseBytes, dest, offset + recordLen, coarseBytes);
-    }
-
-    /** Per-query state for cell selection, coarse admission, deduplication, and fine reranking. */
+    /**
+     * Per-query state for cell selection, coarse admission, deduplication, and fine reranking. Each
+     * search opens its own slices, which shadow the field's: positional reads through a shared
+     * slice are not thread-safe on every directory implementation.
+     */
     final class Search {
+      final RandomAccessInput records = section(1), coarse = section(2);
+      final RandomAccessInput slotDocs = sections.length == 7 ? section(5) : null;
       final float[] rotated = new float[dim];
       final byte[] qCode = new byte[coarseBytes];
       final FineCodec.Query fine;
@@ -263,6 +318,13 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
         fine = Field.this.fine.query(rotated, similarity);
       }
 
+      /** Reads one slot's document ID through this search's own slices. */
+      private int docAt(int slot) throws IOException {
+        return slotDocs != null
+            ? slotDocs.readInt((long) slot * Integer.BYTES)
+            : records.readInt((long) slot * recordLen + docIdOffset);
+      }
+
       /** Chooses the filtered or unfiltered search path and executes it. */
       void run(AcceptDocs acceptDocs) throws IOException {
         int probe = nprobe;
@@ -275,16 +337,20 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
         Bits accept = acceptDocs == null ? null : acceptDocs.bits();
         if (accept instanceof BitSet filter) {
           int cost = acceptDocs.cost();
-          double parity = Math.sqrt((double) SHORTLIST * slotDoc.length * coarseBytes / recordLen);
+          double parity =
+              Math.sqrt((double) SHORTLIST * cellStart[nlist] * coarseBytes / recordLen);
           if (cost > (int) Math.max(SHORTLIST, Math.min(Integer.MAX_VALUE, parity))) {
             filteredScan(selectCells(probe, 1f), filter, cost, probe);
             return;
           }
+          boolean dense = count == segmentMaxDoc;
+          if (dense) loadOrdToSlot();
+          else loadOrdinalMappings();
           int[] slots = new int[64];
           int n = 0;
           DocIdSetIterator accepted = acceptDocs.iterator();
           for (int doc = accepted.nextDoc(); doc != NO_MORE_DOCS; doc = accepted.nextDoc()) {
-            int ord = Arrays.binarySearch(ordToDoc, doc);
+            int ord = dense ? doc : Arrays.binarySearch(ordToDoc, doc);
             if (ord < 0) continue;
             slots = ArrayUtil.grow(slots, n + 1);
             slots[n++] = ordToSlot[ord];
@@ -346,7 +412,7 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
         return ranked;
       }
 
-      /** Prefetches the coarse and fine rows for selected cells. */
+      /** Prefetches the coarse rows for selected cells. */
       private int prefetch(int[] cells, int n) throws IOException {
         int total = 0;
         for (int i = 0; i < n; i++) {
@@ -354,7 +420,6 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
           if (rows == 0) continue;
           total += rows;
           coarse.prefetch((long) start * coarseBytes, (long) rows * coarseBytes);
-          records.prefetch((long) start * recordLen, (long) rows * recordLen);
         }
         return total;
       }
@@ -378,20 +443,15 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
         for (int cell : cells) {
           int base = cellStart[cell], rows = cellStart[cell + 1] - base;
           int[] distances = scratch.distances = ArrayUtil.growNoCopy(scratch.distances, rows);
-          long at = (long) base * coarseBytes;
-          if (coarseSeg != null) {
-            K.hamming(qCode, coarseSeg, at, rows, distances);
+          MemorySegment run = coarseRun(base, rows);
+          if (run != null) {
+            K.hamming(qCode, run, runBase(base), rows, distances);
           } else {
-            MemorySegment run = coarseRun(base, rows);
-            if (run != null) {
-              K.hamming(qCode, run, 0, rows, distances);
-            } else {
-              scratch.bytes = ArrayUtil.growNoCopy(scratch.bytes, coarseBytes);
-              for (int row = 0; row < rows; row++) {
-                coarse.readBytes(
-                    at + (long) row * coarseBytes, scratch.bytes, 0, coarseBytes);
-                distances[row] = K.hamming(qCode, scratch.bytes, 0);
-              }
+            long at = (long) base * coarseBytes;
+            scratch.bytes = ArrayUtil.growNoCopy(scratch.bytes, coarseBytes);
+            for (int row = 0; row < rows; row++) {
+              coarse.readBytes(at + (long) row * coarseBytes, scratch.bytes, 0, coarseBytes);
+              distances[row] = K.hamming(qCode, scratch.bytes, 0);
             }
           }
           for (int from = 0; from < rows; from += ADMIT_BLOCK) {
@@ -425,7 +485,7 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
         scratch.newDedup();
         int[] shortlist = scratch.shortlist;
         for (int i = 0; i < next[cut] && n < SHORTLIST; i++) {
-          int slot = (int) ordered[i], doc = slotDoc[slot];
+          int slot = (int) ordered[i], doc = docAt(slot);
           if ((live == null || live.get(doc)) && scratch.addDistinct(doc)) shortlist[n++] = slot;
         }
         rerank(shortlist, n);
@@ -437,10 +497,36 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
         int len = recordLen, total = Math.multiplyExact(n, len);
         byte[] raw = scratch.bytes = ArrayUtil.growNoCopy(scratch.bytes, total);
         float[] scores = scratch.scores = Scratch.floats(scratch.scores, n);
-        for (int i = 0; i < n; i++) records.readBytes((long) slots[i] * len, raw, i * len, len);
+        readRecords(slots, n, raw);
         fine.score(raw, len, n, scores);
-        for (int i = 0; i < n; i++) collector.collect(slotDoc[slots[i]], scores[i]);
+        for (int i = 0; i < n; i++) {
+          collector.collect((int) BitUtil.VH_LE_INT.get(raw, i * len + docIdOffset), scores[i]);
+        }
         collector.incVisitedCount(n);
+      }
+
+      /**
+       * Reads the fine records of {@code slots}, in one io_uring batch when direct reads are on.
+       */
+      private void readRecords(int[] slots, int n, byte[] raw) throws IOException {
+        int len = recordLen;
+        if (uring != null) {
+          long[] positions = new long[n];
+          int[] lengths = new int[n];
+          for (int i = 0; i < n; i++) {
+            positions[i] = sections[1] + (long) slots[i] * len;
+            lengths[i] = len;
+          }
+          try {
+            MemorySegment[] runs = uring.readBatch(positions, lengths);
+            MemorySegment dest = MemorySegment.ofArray(raw);
+            for (int i = 0; i < n; i++) MemorySegment.copy(runs[i], 0, dest, (long) i * len, len);
+            return;
+          } catch (IOException _) {
+            // fall back to the mapped input
+          }
+        }
+        for (int i = 0; i < n; i++) records.readBytes((long) slots[i] * len, raw, i * len, len);
       }
 
       /** Expands cell probes while scanning a selective document filter. */
@@ -475,14 +561,18 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
           scratch.packed = ArrayUtil.grow(scratch.packed, size + prefetch(batch, n));
           for (int c = 0; c < n; c++) {
             int base = cellStart[batch[c]], end = cellStart[batch[c] + 1];
-            MemorySegment run = coarseSeg == null ? coarseRun(base, end - base) : coarseSeg;
-            long runBase = coarseSeg == null ? 0 : (long) base * coarseBytes;
+            MemorySegment run = coarseRun(base, end - base);
+            long runBase = runBase(base);
             for (int slot = base; slot < end; slot++) {
-              int doc = slotDoc[slot];
+              int doc = docAt(slot);
               if (filter.get(doc) == false) continue;
-              long at = runBase + (long) (slot - base) * coarseBytes;
-              if (run == null) coarse.readBytes((long) slot * coarseBytes, code, 0, coarseBytes);
-              int d = run == null ? K.hamming(qCode, code, 0) : K.hamming(qCode, run, at);
+              int d;
+              if (run != null) {
+                d = K.hamming(qCode, run, runBase + (long) (slot - base) * coarseBytes);
+              } else {
+                coarse.readBytes((long) slot * coarseBytes, code, 0, coarseBytes);
+                d = K.hamming(qCode, code, 0);
+              }
               survivors++;
               if (distinct < SHORTLIST && scratch.addDistinct(doc)) distinct++;
               if (d > threshold) continue;
@@ -497,9 +587,24 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
       }
     }
 
+    /** Decoded vector values over this thread's own record and coarse slices. */
     final class Values extends FloatVectorValues {
+      private final RandomAccessInput records = section(1), coarse = section(2);
       private final byte[] record = new byte[recordLen];
       private final float[] rotated = new float[dim], value = new float[dim];
+
+      /** Opens this view's slices. */
+      Values() throws IOException {}
+
+      /** Copies a staged row while replacing merge-specific metadata. */
+      void copyRow(int ord, int docId, byte[] dest, int offset) throws IOException {
+        loadOrdToSlot();
+        records.readBytes((long) ordToSlot[ord] * recordLen, dest, offset, recordLen);
+        BitUtil.VH_LE_INT.set(dest, offset + docIdOffset, docId);
+        BitUtil.VH_LE_INT.set(dest, offset + CodeRecord.primaryCellOffset(docIdOffset), 0);
+        coarse.readBytes(
+            (long) ordToSlot[ord] * coarseBytes, dest, offset + recordLen, coarseBytes);
+      }
 
       /** Returns the vector dimension. */
       @Override
@@ -516,41 +621,65 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
       /** Decodes and inverse-rotates one vector value. */
       @Override
       public float[] vectorValue(int ord) throws IOException {
+        rotation.inverseRotate(rotatedValue(ord), value);
+        return value;
+      }
+
+      /** Decodes one normalized vector value in the rotated space. */
+      private float[] rotatedValue(int ord) throws IOException {
+        loadOrdToSlot();
         records.readBytes((long) ordToSlot[ord] * recordLen, record, 0, recordLen);
         fine.decode(record, 0, rotated);
         VectorUtil.l2normalize(rotated, false);
-        rotation.inverseRotate(rotated, value);
-        return value;
+        return rotated;
       }
 
       /** Maps a vector ordinal to its document ID. */
       @Override
       public int ordToDoc(int ord) {
+        if (count == segmentMaxDoc) return ord;
+        loadMappings();
         return ordToDoc[ord];
       }
 
       /** Creates an independent vector-values view. */
       @Override
-      public FloatVectorValues copy() {
+      public FloatVectorValues copy() throws IOException {
         return new Values();
       }
 
       /** Creates an iterator over vector ordinals and documents. */
       @Override
       public DocIndexIterator iterator() {
+        if (count == segmentMaxDoc) return createDenseIterator();
+        loadMappings();
         return createSparseIterator();
       }
 
-      /** Creates an exact scorer over decoded vectors. */
+      /** Loads ordinal mappings for sparse fields from methods that cannot throw IOException. */
+      private void loadMappings() {
+        try {
+          loadOrdinalMappings();
+        } catch (IOException ioe) {
+          throw new UncheckedIOException(ioe);
+        }
+      }
+
+      /**
+       * Creates an exact scorer over decoded vectors. The rotation is orthogonal, so the query is
+       * rotated once instead of inverse-rotating every scored vector.
+       */
       @Override
-      public VectorScorer scorer(float[] target) {
+      public VectorScorer scorer(float[] target) throws IOException {
         Values values = new Values();
         DocIndexIterator iterator = values.iterator();
+        float[] query = new float[dim];
+        rotation.rotate(target, query);
         return new VectorScorer() {
           /** Scores the iterator's current vector. */
           @Override
           public float score() throws IOException {
-            return similarity.compare(target, values.vectorValue(iterator.index()));
+            return similarity.compare(query, values.rotatedValue(iterator.index()));
           }
 
           /** Returns the scorer's shared vector iterator. */
@@ -614,6 +743,11 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
     return field == null || field.count == 0 ? null : field.open();
   }
 
+  /** Returns whether fine records are read with io_uring instead of the mapped input. */
+  boolean readsFineDirectly() {
+    return uring != null;
+  }
+
   /** Returns the segment name used by hot-start tracking. */
   String segment() {
     return segment;
@@ -658,17 +792,18 @@ final class IVFasterEvoVectorsReader extends KnnVectorsReader {
 
   /** Closes the segment data input and optionally reports scan engagement. */
   @Override
+  @SuppressForbidden(reason = "opt-in benchmark engagement report")
   public void close() throws IOException {
     if (REPORT_ENGAGEMENT) {
-      long queries = Math.max(1, SCAN_QUERIES.get());
+      long queries = SCAN_QUERIES.get(), per = Math.max(1, queries);
       System.out.println(
           "[ivfaster-evo] queries="
-              + SCAN_QUERIES.get()
+              + queries
               + " slotsScanned/query="
-              + SCANNED_SLOTS.get() / queries
+              + SCANNED_SLOTS.get() / per
               + " cellsProbed/query="
-              + PROBED_CELLS.get() / queries);
+              + PROBED_CELLS.get() / per);
     }
-    data.close();
+    IOUtils.close(data, uring);
   }
 }

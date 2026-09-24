@@ -26,11 +26,13 @@ import org.apache.lucene.index.SegmentWriteState;
 import org.apache.lucene.search.knn.KnnSearchStrategy;
 
 /**
- * Configures the IVFasterEvo inverted-file vector format.
+ * Two-tier inverted-file (IVF) vector format: a Nitrox2 Hamming scan over the probed cells followed
+ * by an INT8 or FP32 rerank of a bounded shortlist.
  *
- * <p>{@code nlist} controls the number of cells, {@code nprobe} controls how many cells a query
- * visits, spill bits add secondary cell placements near boundaries, and the fine tier controls
- * shortlist reranking precision.
+ * <p>{@code nlist} is the target number of cells per segment (at most one per vector), {@code
+ * nprobe} is the default number of cells a query visits, {@code spillBits} is the maximum number of
+ * boundary cells each vector is also written to, and {@link FineTier} selects the rerank encoding.
+ * Use {@link SearchStrategy} to override the probe count per query.
  *
  * @lucene.experimental
  */
@@ -38,39 +40,67 @@ public final class IVFasterEvoVectorsFormat extends KnnVectorsFormat {
   static final String NAME = "IVFasterEvoVectorsFormat";
   static final String META_CODEC_NAME = NAME + "Meta", DATA_CODEC_NAME = NAME + "Data";
   static final String META_EXTENSION = "ivfm", DATA_EXTENSION = "ivfd";
-  static final int VERSION_START = 1, VERSION_CURRENT = 1, DIRECT_MONOTONIC_BLOCK_SHIFT = 16;
+  static final int VERSION_START = 1, DIRECT_MONOTONIC_BLOCK_SHIFT = 16;
+
+  /** Adds a persisted slot-to-document section so search never reads doc IDs from fine records. */
+  static final int VERSION_SLOT_DOC = 2, VERSION_CURRENT = VERSION_SLOT_DOC;
+
+  /** Maximum configurable number of cells per field. */
   public static final int MAX_NLIST = 0xFFFF;
+
+  /** Default {@link SearchStrategy} probe margin. */
+  static final float DEFAULT_PROBE_MARGIN = 0.75f;
+
   final int nlist, nprobe, spillBits;
   final FineTier fineTier;
 
+  /** Encoding of the fine rerank tier. */
   public enum FineTier {
+    /** Scalar-quantized 8-bit fine codes. */
     INT8,
+    /** Full-precision float fine vectors. */
     FP32
   }
 
-  /** Creates the default IVFasterEvo format. */
+  /** Creates a format with 1000 cells, 32 probes, one spill cell, and INT8 reranking. */
   public IVFasterEvoVectorsFormat() {
     this(1000, 32);
   }
 
-  /** Creates a format with custom cell and probe counts. */
+  /** Creates a format with custom cell and probe counts, one spill cell, and INT8 reranking. */
   public IVFasterEvoVectorsFormat(int nlist, int nprobe) {
-    this(nlist, nprobe, 3, FineTier.INT8);
+    this(nlist, nprobe, 1, FineTier.INT8);
   }
 
-  /** Creates a fully configured IVFasterEvo format. */
+  /** Creates a fully configured format. */
   public IVFasterEvoVectorsFormat(int nlist, int nprobe, int spillBits, FineTier fineTier) {
     super(NAME);
-    if (nlist < 1 || nlist > MAX_NLIST || nprobe < 1 || spillBits < 0 || fineTier == null)
-      throw new IllegalArgumentException("nlist 1..65535, nprobe >= 1, spillBits >= 0, fineTier");
+    if (nlist < 1 || nlist > MAX_NLIST || nprobe < 1 || spillBits < 0 || fineTier == null) {
+      throw new IllegalArgumentException(
+          "require 1 <= nlist <= "
+              + MAX_NLIST
+              + ", nprobe >= 1, spillBits >= 0 and non-null fineTier; got nlist="
+              + nlist
+              + " nprobe="
+              + nprobe
+              + " spillBits="
+              + spillBits
+              + " fineTier="
+              + fineTier);
+    }
     this.nlist = nlist;
     this.nprobe = nprobe;
     this.spillBits = spillBits;
     this.fineTier = fineTier;
   }
 
-  static final float DEFAULT_PROBE_MARGIN = 0.75f;
-
+  /**
+   * Per-query probe count and probe margin.
+   *
+   * <p>The query visits at most {@code numProbes} cells, stopping early at the first cell whose
+   * centroid distance exceeds {@code probeMargin} times the nearest cell's; a margin of 1 disables
+   * the cutoff.
+   */
   public static final class SearchStrategy extends KnnSearchStrategy {
     final int numProbes;
     final float probeMargin;
@@ -82,13 +112,19 @@ public final class IVFasterEvoVectorsFormat extends KnnVectorsFormat {
 
     /** Creates a search strategy with explicit probes and margin. */
     public SearchStrategy(int numProbes, float probeMargin) {
-      if (numProbes < 1 || (probeMargin > 0 && probeMargin <= 1) == false)
-        throw new IllegalArgumentException("require numProbes >= 1 and 0 < probeMargin <= 1");
+      // Negated so NaN is rejected.
+      if (numProbes < 1 || (probeMargin > 0 && probeMargin <= 1) == false) {
+        throw new IllegalArgumentException(
+            "require numProbes >= 1 and 0 < probeMargin <= 1; got numProbes="
+                + numProbes
+                + " probeMargin="
+                + probeMargin);
+      }
       this.numProbes = numProbes;
       this.probeMargin = probeMargin;
     }
 
-    /** Advances no state because IVFaster probes cells in one search pass. */
+    /** Advances no state because cells are probed in a single pass. */
     @Override
     public void nextVectorsBlock() {}
 

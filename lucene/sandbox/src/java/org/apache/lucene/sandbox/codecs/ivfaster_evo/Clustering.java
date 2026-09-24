@@ -40,16 +40,15 @@ final class Clustering {
 
   static final int OVERSAMPLE = 3, MIN_SHORTLIST = 32;
 
-  static final float MARGIN = Float.parseFloat(System.getProperty("ivfaster.spillMargin", "1.40"));
+  static final float MARGIN = Float.parseFloat(System.getProperty("ivfaster.spillMargin", "1.05"));
 
   static final float REAP_MARGIN = 1.02f;
 
   static final float SOAR_LAMBDA = 1f;
 
-  static final float CONVERGE_FRACTION =
-      Float.parseFloat(System.getProperty("ivfaster.convergeFraction", "0.005"));
+  static final float CONVERGE_FRACTION = 0.005f;
 
-  static final int MAX_ITERS = Integer.getInteger("ivfaster.lloydIters", 10);
+  static final int MAX_ITERS = 10;
 
   static final long FIX = 1L << 30;
 
@@ -93,6 +92,7 @@ final class Clustering {
       iterations++;
     } while (run.reap(false) > convergeAt && iterations < MAX_ITERS);
     run.reap(true);
+    // Vectors the final reap skipped, or all vectors when spilling is off, keep only their primary.
     for (int i = 0; i < count; i++) {
       if (run.cells[i * run.stride] < 0) run.cells[i * run.stride] = run.assignment[i];
     }
@@ -199,7 +199,6 @@ final class Clustering {
               int carried = warm == null ? -1 : warm.assignment[i];
               if (carried >= 0 && carried < nlist) {
                 assignment[i] = carried;
-                cell2[i] = warm.cell2[i];
                 if (Float.isNaN(warm.d1[i])) {
                   d1[i] = codes.exactDistance(vector, carried);
                   // The seed centroids may combine several source segments, so a carried
@@ -209,6 +208,7 @@ final class Clustering {
                 } else {
                   d1[i] = warm.d1[i];
                   d2[i] = warm.d2[i];
+                  cell2[i] = warm.cell2[i];
                 }
               } else {
                 cur.coarseInto(scratch.qCode);
@@ -256,7 +256,7 @@ final class Clustering {
     /** Rechecks vectors whose assignment may have changed. */
     int reap(boolean last) throws IOException {
       boolean withSpill = last && spillBits > 0;
-      int keep = withSpill ? 1 + spillBits : 2, shortlist = shortlistFor(keep);
+      int keep = withSpill ? stride : 2, shortlist = shortlistFor(keep);
       AtomicInteger changed = new AtomicInteger();
       Parallel.overRange(
           count,
@@ -301,7 +301,6 @@ final class Clustering {
               }
               docSlack[i] = docMaxSlack[i] = 0f;
               if (withSpill) spill(vector, spillCands, n, d1[i], d2[i], i * stride);
-              else if (last) cells[i * stride] = assignment[i];
             }
             changed.addAndGet(localChanged);
           });

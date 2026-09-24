@@ -40,7 +40,13 @@ import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.FixedBitSet;
 
 /**
- * IVFasterEvo query variant that materializes dense filters for filter-aware vector search.
+ * A {@link KnnFloatVectorQuery} for IVFasterEvo fields that hands dense filters to the codec as a
+ * per-segment bit set, so the reader can choose between a filtered cell scan and visiting the
+ * accepted documents directly.
+ *
+ * <p>If the filter intersected with the field rewrites to a single clause, the query falls back to
+ * a plain {@link KnnFloatVectorQuery}. Segments where at most {@code k} documents match are
+ * searched exactly.
  *
  * @lucene.experimental
  */
@@ -48,7 +54,7 @@ public final class IVFasterEvoKnnQuery extends KnnFloatVectorQuery {
   private final Query denseFilter;
   private final Weight filterWeight;
 
-  /** Creates an IVFaster query with optional dense filtering. */
+  /** Creates a query probing {@code numProbes} cells, with an optional (possibly null) filter. */
   public IVFasterEvoKnnQuery(String field, float[] target, int k, Query filter, int numProbes) {
     super(field, target, k, null, new IVFasterEvoVectorsFormat.SearchStrategy(numProbes));
     this.denseFilter = filter;
@@ -62,7 +68,7 @@ public final class IVFasterEvoKnnQuery extends KnnFloatVectorQuery {
     this.filterWeight = filterWeight;
   }
 
-  /** Rewrites dense filters so IVFaster can choose the filtered search path. */
+  /** Intersects the filter with the field and pre-creates its weight for segment search. */
   @Override
   public Query rewrite(IndexSearcher searcher) throws IOException {
     if (denseFilter == null || filterWeight != null) return super.rewrite(searcher);
@@ -78,7 +84,7 @@ public final class IVFasterEvoKnnQuery extends KnnFloatVectorQuery {
     return new IVFasterEvoKnnQuery(this, weight).rewrite(searcher);
   }
 
-  /** Materializes the dense filter before running approximate vector search. */
+  /** Materializes the filter into a bit set, then searches exactly or approximately. */
   @Override
   protected TopDocs approximateSearch(
       LeafReaderContext context, AcceptDocs live, int limit, KnnCollectorManager manager)

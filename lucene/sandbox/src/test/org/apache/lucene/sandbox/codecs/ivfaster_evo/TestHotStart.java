@@ -219,7 +219,8 @@ public class TestHotStart extends LuceneTestCase {
                 .build();
         TopDocs few = searcher.search(new IVFasterEvoKnnQuery("v", query, 10, three, 1), 10);
         assertEquals(3, few.scoreDocs.length);
-        assertEquals(0, few.scoreDocs[0].doc);
+        int queryDoc = searcher.search(new TermQuery(new Term("id", "0")), 1).scoreDocs[0].doc;
+        assertEquals(queryDoc, few.scoreDocs[0].doc);
         assertEquals(
             new IVFasterEvoKnnQuery("v", query, 10, filter, 2),
             new IVFasterEvoKnnQuery("v", query, 10, filter, 2));
